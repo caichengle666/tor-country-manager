@@ -1,0 +1,8 @@
+Tor Country Manager is an independent project and is not endorsed by or
+affiliated with The Tor Project.
+
+The application can run the Tor client as a separate process. Tor and its
+bundled dependencies remain subject to their own licenses and trademark
+policies. See https://www.torproject.org/ and the license files distributed
+with the relevant Tor package.
+

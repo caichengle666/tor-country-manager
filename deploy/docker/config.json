@@ -1,0 +1,19 @@
+{
+  "listen_address": "0.0.0.0:8080",
+  "proxy_address": "0.0.0.0:1080",
+  "tor_binary": "/usr/bin/tor",
+  "state_dir": "/data/state",
+  "geoip_file": "/usr/share/tor/geoip",
+  "geoip6_file": "/usr/share/tor/geoip6",
+  "base_socks_port": 19050,
+  "max_running": 4,
+  "auth_token": "",
+  "upstream_socks5": "",
+  "upstream_username": "",
+  "upstream_password": "",
+  "countries": [
+    {"code": "us", "name": "美国"},
+    {"code": "jp", "name": "日本"},
+    {"code": "de", "name": "德国"}
+  ]
+}

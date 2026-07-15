@@ -1,0 +1,15 @@
+Tor 国家出口管理器 - Windows x64 测试版
+========================================
+
+管理器：Go 单文件版本
+Tor：0.4.9.11 (git-f3d28b2e0978ca07)
+Tor Expert Bundle：15.0.17 Windows x86_64
+
+Tor 官方归档文件：
+tor-expert-bundle-windows-x86_64-15.0.17.tar.gz
+
+官方 SHA-256：
+5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1
+
+打包时已经核对上述 SHA-256。Tor 及其依赖的许可证说明位于 runtime/docs。
+

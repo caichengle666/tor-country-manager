@@ -1,0 +1,14 @@
+services:
+  tor-country-manager:
+    image: ghcr.io/caichengle666/tor-country-manager:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1080:1080"
+    volumes:
+      - tor-country-data:/data
+
+volumes:
+  tor-country-data:
+

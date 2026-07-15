@@ -1,0 +1,26 @@
+[Unit]
+Description=Tor Country Web Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tor-manager
+Group=tor-manager
+StateDirectory=tor-country-manager
+ExecStart=/usr/local/bin/tor-country-manager -config /var/lib/tor-country-manager/config.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

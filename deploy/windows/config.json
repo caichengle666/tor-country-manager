@@ -1,0 +1,26 @@
+{
+  "listen_address": "127.0.0.1:8080",
+  "proxy_address": "127.0.0.1:1080",
+  "tor_binary": "./runtime/tor/tor.exe",
+  "state_dir": "./state",
+  "geoip_file": "./runtime/data/geoip",
+  "geoip6_file": "./runtime/data/geoip6",
+  "base_socks_port": 19050,
+  "max_running": 6,
+  "auth_token": "",
+  "upstream_socks5": "",
+  "upstream_username": "",
+  "upstream_password": "",
+  "countries": [
+    {"code": "us", "name": "美国"},
+    {"code": "jp", "name": "日本"},
+    {"code": "de", "name": "德国"},
+    {"code": "gb", "name": "英国"},
+    {"code": "fr", "name": "法国"},
+    {"code": "nl", "name": "荷兰"},
+    {"code": "ca", "name": "加拿大"},
+    {"code": "sg", "name": "新加坡"},
+    {"code": "ch", "name": "瑞士"},
+    {"code": "se", "name": "瑞典"}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "listen_address": "127.0.0.1:8080",
+  "proxy_address": "127.0.0.1:1080",
+  "tor_binary": "/opt/homebrew/bin/tor",
+  "state_dir": "./state",
+  "geoip_file": "/opt/homebrew/share/tor/geoip",
+  "geoip6_file": "/opt/homebrew/share/tor/geoip6",
+  "base_socks_port": 19050,
+  "max_running": 4,
+  "auth_token": "",
+  "upstream_socks5": "",
+  "upstream_username": "",
+  "upstream_password": "",
+  "countries": [
+    {"code": "us", "name": "美国"},
+    {"code": "jp", "name": "日本"},
+    {"code": "de", "name": "德国"}
+  ]
+}
+
