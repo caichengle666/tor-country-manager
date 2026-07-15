@@ -6,7 +6,7 @@
   "geoip_file": "/opt/homebrew/share/tor/geoip",
   "geoip6_file": "/opt/homebrew/share/tor/geoip6",
   "base_socks_port": 19050,
-  "max_running": 4,
+  "max_running": 10,
   "auth_token": "",
   "upstream_socks5": "",
   "upstream_username": "",
@@ -17,4 +17,3 @@
     {"code": "de", "name": "德国"}
   ]
 }
-

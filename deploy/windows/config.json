@@ -6,7 +6,7 @@
   "geoip_file": "./runtime/data/geoip",
   "geoip6_file": "./runtime/data/geoip6",
   "base_socks_port": 19050,
-  "max_running": 6,
+  "max_running": 10,
   "auth_token": "",
   "upstream_socks5": "",
   "upstream_username": "",

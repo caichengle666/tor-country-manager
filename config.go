@@ -42,7 +42,7 @@ func defaultConfig() Config {
 		GeoIPFile:     "/usr/share/tor/geoip",
 		GeoIPv6File:   "/usr/share/tor/geoip6",
 		BaseSocksPort: 19050,
-		MaxRunning:    6,
+		MaxRunning:    10,
 		Countries: []Country{
 			{Code: "us", Name: "美国"},
 			{Code: "jp", Name: "日本"},

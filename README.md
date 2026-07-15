@@ -89,7 +89,7 @@ sudo systemctl status tor-country-manager
 sudo journalctl -u tor-country-manager -f
 ```
 
-1GB 内存的服务器建议将 `max_running` 保持在 `5` 到 `7`。达到上限后，选择新国家会停止最早启动且当前未使用的实例。
+默认允许同时保持 `10` 个国家实例在线。达到上限后，选择新国家会停止最早启动且当前未使用的实例。10个实例建议至少准备2GB内存；1GB服务器建议将 `max_running` 调低到 `5` 到 `7`。
 
 可写配置位于 `/var/lib/tor-country-manager/config.json`，仅允许 `tor-manager` 服务用户访问。Web管理页面修改上游代理时会写入该文件。修改后执行：
 

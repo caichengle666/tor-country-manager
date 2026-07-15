@@ -6,7 +6,7 @@
   "geoip_file": "/usr/share/tor/geoip",
   "geoip6_file": "/usr/share/tor/geoip6",
   "base_socks_port": 19050,
-  "max_running": 4,
+  "max_running": 10,
   "auth_token": "",
   "upstream_socks5": "",
   "upstream_username": "",
