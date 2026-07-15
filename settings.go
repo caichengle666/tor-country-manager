@@ -22,6 +22,10 @@ type UpstreamSettings struct {
 	HasPassword bool   `json:"has_password"`
 }
 
+type RuntimeSettings struct {
+	MaxRunning int `json:"max_running"`
+}
+
 type UpstreamUpdate struct {
 	Address       string  `json:"address"`
 	Username      string  `json:"username"`
@@ -30,7 +34,36 @@ type UpstreamUpdate struct {
 }
 
 func NewConfigStore(path string, cfg Config) *ConfigStore {
-	return &ConfigStore{path: path, cfg: cfg}
+	stored := cfg
+	if b, err := os.ReadFile(path); err == nil {
+		stored = defaultConfig()
+		if json.Unmarshal(b, &stored) != nil {
+			stored = cfg
+		}
+	} else if os.Getenv("TOR_UPSTREAM_SOCKS5") != "" {
+		stored.UpstreamSOCKS5 = ""
+		stored.UpstreamUsername = ""
+		stored.UpstreamPassword = ""
+	}
+	return &ConfigStore{path: path, cfg: stored}
+}
+
+func (s *ConfigStore) Runtime() RuntimeSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return RuntimeSettings{MaxRunning: s.cfg.MaxRunning}
+}
+
+func (s *ConfigStore) UpdateMaxRunning(limit int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.cfg
+	next.MaxRunning = limit
+	if err := next.validate(); err != nil {
+		return err
+	}
+	s.cfg = next
+	return s.saveLocked()
 }
 
 func (s *ConfigStore) Upstream() UpstreamSettings {

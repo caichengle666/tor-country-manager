@@ -127,6 +127,22 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 	mux.HandleFunc("GET /api/settings/upstream", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, configStore.Upstream())
 	})
+	mux.HandleFunc("GET /api/settings/runtime", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, configStore.Runtime())
+	})
+	mux.HandleFunc("PUT /api/settings/runtime", func(w http.ResponseWriter, r *http.Request) {
+		var input RuntimeSettings
+		if err := decodeJSON(r, &input); err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := configStore.UpdateMaxRunning(input.MaxRunning); err != nil {
+			writeError(w, err)
+			return
+		}
+		manager.UpdateMaxRunning(input.MaxRunning)
+		writeJSON(w, http.StatusOK, map[string]any{"settings": configStore.Runtime(), "applied": true})
+	})
 	mux.HandleFunc("PUT /api/settings/upstream", func(w http.ResponseWriter, r *http.Request) {
 		var update UpstreamUpdate
 		if err := decodeJSON(r, &update); err != nil {

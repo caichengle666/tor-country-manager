@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -43,7 +44,8 @@ func TestStateAPIAndWebPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	configStore := NewConfigStore(filepath.Join(t.TempDir(), "config.json"), cfg)
-	handler := routes(NewManager(cfg), NewExitCatalog(cfg), configStore, authStore, cfg)
+	manager := NewManager(cfg)
+	handler := routes(manager, NewExitCatalog(cfg), configStore, authStore, cfg)
 
 	request := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	response := httptest.NewRecorder()
@@ -69,6 +71,14 @@ func TestStateAPIAndWebPage(t *testing.T) {
 		t.Fatalf("authenticated API returned %d: %s", response.Code, response.Body.String())
 	}
 
+	request = httptest.NewRequest(http.MethodPut, "/api/settings/runtime", strings.NewReader(`{"max_running":3}`))
+	request.AddCookie(sessionCookie)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || manager.State().MaxRunning != 3 {
+		t.Fatalf("runtime settings returned %d: %s", response.Code, response.Body.String())
+	}
+
 	request = httptest.NewRequest(http.MethodGet, "/", nil)
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -87,5 +97,25 @@ func TestPasswordHash(t *testing.T) {
 	}
 	if verifyPassword(hash, "wrong-password") {
 		t.Fatal("invalid password was accepted")
+	}
+}
+
+func TestRuntimeUpdateDoesNotPersistEnvironmentProxy(t *testing.T) {
+	t.Setenv("TOR_UPSTREAM_SOCKS5", "proxy.example:1080")
+	cfg := defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamUsername = "environment-user"
+	cfg.UpstreamPassword = "environment-secret"
+	path := filepath.Join(t.TempDir(), "config.json")
+	store := NewConfigStore(path, cfg)
+	if err := store.UpdateMaxRunning(7); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "environment-secret") || strings.Contains(string(b), "environment-user") {
+		t.Fatal("environment proxy credentials were persisted")
 	}
 }

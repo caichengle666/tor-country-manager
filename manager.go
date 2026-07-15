@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -297,6 +298,38 @@ func (m *Manager) Activate(code string) error {
 	m.active = code
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) UpdateMaxRunning(limit int) {
+	m.mu.Lock()
+	m.cfg.MaxRunning = limit
+	running := 0
+	candidates := make([]*Instance, 0)
+	for code, instance := range m.instances {
+		if instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" {
+			continue
+		}
+		running++
+		if code != m.active {
+			candidates = append(candidates, instance)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].StartedAt.Before(candidates[j].StartedAt) })
+	stopCount := running - limit
+	if stopCount < 0 {
+		stopCount = 0
+	}
+	if stopCount > len(candidates) {
+		stopCount = len(candidates)
+	}
+	codes := make([]string, 0, stopCount)
+	for index := 0; index < stopCount; index++ {
+		codes = append(codes, candidates[index].Country.Code)
+	}
+	m.mu.Unlock()
+	for _, code := range codes {
+		_ = m.Stop(code)
+	}
 }
 
 func (m *Manager) ensureCountry(country Country) (*Instance, error) {

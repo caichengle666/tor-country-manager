@@ -57,8 +57,13 @@
 
 <div id="settings-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
   <section class="modal" style="width:min(620px,100%)">
-    <header class="modal-head"><div><h2 id="settings-title">管理设置</h2><div class="muted">修改代理配置后需要重启管理器才能生效</div></div><button id="settings-close" class="modal-close">关闭</button></header>
+    <header class="modal-head"><div><h2 id="settings-title">管理设置</h2><div class="muted">在线数量立即生效；修改代理配置后需要重启管理器</div></div><button id="settings-close" class="modal-close">关闭</button></header>
     <div class="settings-body">
+      <section class="form-section"><h3>在线国家数量</h3><form id="runtime-form" class="form">
+        <label>最多同时在线国家数（1～32）<input id="max-running" type="number" min="1" max="32" step="1" required></label>
+        <div class="muted">保存后立即生效。调低上限时会保留当前出口，并停止最早启动的其他实例。</div>
+        <button type="submit">保存在线数量</button>
+      </form><div id="runtime-message" class="message"></div></section>
       <section class="form-section"><h3>上游 SOCKS5 代理</h3><form id="upstream-form" class="form">
         <label>主机名和端口<input id="upstream-address" placeholder="nas.example.com:1080"></label>
         <label>用户名<input id="upstream-username" autocomplete="username"></label>
@@ -124,13 +129,14 @@ function renderNodes(nodes){
 }
 function closeModal(){openCountry='';modal.classList.remove('open');clearInterval(nodePoll);nodePoll=null}
 async function openSettings(){
-  $('#upstream-message').textContent='';$('#password-message').textContent='';const settings=await api('/api/settings/upstream');$('#upstream-address').value=settings.address||'';$('#upstream-username').value=settings.username||'';$('#upstream-password').value='';$('#upstream-password').placeholder=settings.has_password?'已保存密码，留空表示保持不变':'输入代理密码';$('#upstream-clear').checked=false;settingsModal.classList.add('open');
+  $('#runtime-message').textContent='';$('#upstream-message').textContent='';$('#password-message').textContent='';const [runtime,settings]=await Promise.all([api('/api/settings/runtime'),api('/api/settings/upstream')]);$('#max-running').value=runtime.max_running;$('#upstream-address').value=settings.address||'';$('#upstream-username').value=settings.username||'';$('#upstream-password').value='';$('#upstream-password').placeholder=settings.has_password?'已保存密码，留空表示保持不变':'输入代理密码';$('#upstream-clear').checked=false;settingsModal.classList.add('open');
 }
 function closeSettings(){settingsModal.classList.remove('open')}
 countriesEl.onclick=async event=>{const button=event.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='nodes'){try{await openNodes(button.dataset.code,button.dataset.name)}catch(error){showError(error)}return}button.disabled=true;try{stateCache=await api(`/api/countries/${button.dataset.code}/stop`,{method:'POST'});renderCountries()}catch(error){showError(error)}finally{button.disabled=false}};
 nodeList.onclick=async event=>{const button=event.target.closest('button[data-fingerprint]');if(!button)return;button.disabled=true;button.textContent='正在连接…';try{stateCache=await api(`/api/exits/nodes/${button.dataset.fingerprint}/activate`,{method:'POST'});closeModal();renderCountries();setTimeout(loadState,1200)}catch(error){showError(error);button.disabled=false;button.textContent='使用此IP'}};
 $('#modal-close').onclick=closeModal;modal.onclick=event=>{if(event.target===modal)closeModal()};
 $('#settings').onclick=()=>openSettings().catch(showError);$('#settings-close').onclick=closeSettings;settingsModal.onclick=event=>{if(event.target===settingsModal)closeSettings()};
+$('#runtime-form').onsubmit=async event=>{event.preventDefault();const limit=Number($('#max-running').value);try{const result=await api('/api/settings/runtime',{method:'PUT',body:JSON.stringify({max_running:limit})});stateCache.max_running=result.settings.max_running;$('#runtime-message').textContent=`已生效：最多同时在线 ${result.settings.max_running} 个国家`}catch(error){$('#runtime-message').textContent=error.message}};
 $('#upstream-form').onsubmit=async event=>{event.preventDefault();const password=$('#upstream-password').value;const update={address:$('#upstream-address').value.trim(),username:$('#upstream-username').value.trim(),clear_password:$('#upstream-clear').checked};if(password)update.password=password;try{const result=await api('/api/settings/upstream',{method:'PUT',body:JSON.stringify(update)});$('#upstream-message').textContent=result.restart_required?'已保存到 config.json，请重启管理器使配置生效':'已保存'}catch(error){$('#upstream-message').textContent=error.message}};
 $('#password-form').onsubmit=async event=>{event.preventDefault();const current=$('#current-password').value,replacement=$('#new-password').value,confirm=$('#confirm-password').value;if(replacement!==confirm){$('#password-message').textContent='两次输入的新密码不一致';return}try{await api('/api/settings/password',{method:'PUT',body:JSON.stringify({current_password:current,new_password:replacement})});$('#password-message').textContent='管理密码已修改';$('#current-password').value='';$('#new-password').value='';$('#confirm-password').value=''}catch(error){$('#password-message').textContent=error.message}};
 $('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST'});showAuth('login')}catch(error){showError(error)}};
