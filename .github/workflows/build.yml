@@ -67,9 +67,103 @@ jobs:
           path: dist/${{ matrix.output }}
           if-no-files-found: error
 
-  release:
+  bundle:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: tor-country-manager-linux-amd64
+            exe: ""
+            tor_install: "sudo apt-get update && sudo apt-get install -y --no-install-recommends tor tor-geoipdb"
+            tor_bin: "/usr/bin/tor"
+            geoip: "/usr/share/tor/geoip"
+            geoip6: "/usr/share/tor/geoip6"
+            pkg: tar.gz
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            binary: tor-country-manager-linux-arm64
+            exe: ""
+            tor_install: "sudo apt-get update && sudo apt-get install -y --no-install-recommends tor tor-geoipdb"
+            tor_bin: "/usr/bin/tor"
+            geoip: "/usr/share/tor/geoip"
+            geoip6: "/usr/share/tor/geoip6"
+            pkg: tar.gz
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: tor-country-manager-windows-amd64.exe
+            exe: ".exe"
+            tor_install: "curl -L -o tor.zip https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-expert-bundle-windows-x86_64-13.5.6.zip && 7z x tor.zip -oC:/tor-expert"
+            tor_bin: "C:/tor-expert/Tor/tor.exe"
+            geoip: "C:/tor-expert/Data/Tor/geoip"
+            geoip6: "C:/tor-expert/Data/Tor/geoip6"
+            pkg: zip
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            binary: tor-country-manager-macos-amd64
+            exe: ""
+            tor_install: "curl -L -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-expert-bundle-macos-x86_64-13.5.6.tar.gz && mkdir -p /tmp/tor-expert && tar -xzf tor.tar.gz -C /tmp/tor-expert --strip-components=1"
+            tor_bin: "/tmp/tor-expert/Tor/tor"
+            geoip: "/tmp/tor-expert/Data/Tor/geoip"
+            geoip6: "/tmp/tor-expert/Data/Tor/geoip6"
+            pkg: tar.gz
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            binary: tor-country-manager-macos-arm64
+            exe: ""
+            tor_install: "curl -L -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-expert-bundle-macos-aarch64-13.5.6.tar.gz && mkdir -p /tmp/tor-expert && tar -xzf tor.tar.gz -C /tmp/tor-expert --strip-components=1"
+            tor_bin: "/tmp/tor-expert/Tor/tor"
+            geoip: "/tmp/tor-expert/Data/Tor/geoip"
+            geoip6: "/tmp/tor-expert/Data/Tor/geoip6"
+            pkg: tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+      - name: Install Tor and GeoIP
+        shell: bash
+        run: ${{ matrix.tor_install }}
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="dist/bundle/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$bundle/runtime/tor" "$bundle/runtime/data"
+          cp "${{ matrix.binary }}" "$bundle/TorCountryManager${{ matrix.exe }}"
+          cp "${{ matrix.tor_bin }}" "$bundle/runtime/tor/tor${{ matrix.exe }}"
+          cp "${{ matrix.geoip }}" "$bundle/runtime/data/geoip"
+          cp "${{ matrix.geoip6 }}" "$bundle/runtime/data/geoip6"
+          chmod +x "$bundle/TorCountryManager${{ matrix.exe }}" "$bundle/runtime/tor/tor${{ matrix.exe }}" || true
+      - name: Package bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist/bundle
+          name="tor-country-manager-${{ matrix.goos }}-${{ matrix.goarch }}-bundle"
+          if [ "${{ matrix.pkg }}" = "zip" ]; then
+            7z a -tzip "../${name}.zip" "${{ matrix.goos }}-${{ matrix.goarch }}" || powershell -NoProfile -Command "Compress-Archive -Force -Path './${{ matrix.goos }}-${{ matrix.goarch }}' -DestinationPath '../${name}.zip'"
+          else
+            tar -czf "../${name}.tar.gz" "${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tor-country-manager-${{ matrix.goos }}-${{ matrix.goarch }}-bundle
+          path: dist/tor-country-manager-${{ matrix.goos }}-${{ matrix.goarch }}-bundle.${{ matrix.pkg }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -84,4 +178,3 @@ jobs:
         with:
           generate_release_notes: true
           files: dist/*
-
