@@ -286,8 +286,96 @@ func (c *ExitCatalog) Node(fingerprint string) (ExitNode, bool) {
 	return node, ok
 }
 
+func (c *ExitCatalog) SelectNode(ctx context.Context, countries []string, policy string) (ExitNode, error) {
+	if len(countries) == 0 {
+		return ExitNode{}, errors.New("at least one country is required")
+	}
+	seen := make(map[string]bool)
+	normalized := make([]string, 0, len(countries))
+	for _, country := range countries {
+		code := normalizeCode(country)
+		if !countryCodePattern.MatchString(code) {
+			return ExitNode{}, fmt.Errorf("invalid country code %q", country)
+		}
+		if !seen[code] {
+			seen[code] = true
+			normalized = append(normalized, code)
+		}
+	}
+	if len(normalized) > 20 {
+		return ExitNode{}, errors.New("no more than 20 candidate countries are allowed")
+	}
+	if policy == "" {
+		policy = "lowest_latency"
+	}
+	if policy != "lowest_latency" && policy != "failover" {
+		return ExitNode{}, errors.New("policy must be lowest_latency or failover")
+	}
+	for _, code := range normalized {
+		c.startLatencyChecks(code, 10)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ExitNode{}, ctx.Err()
+	case <-timer.C:
+	}
+	if node, ok := c.bestCandidate(normalized, policy, true); ok {
+		return node, nil
+	}
+	if node, ok := c.bestCandidate(normalized, policy, false); ok {
+		return node, nil
+	}
+	return ExitNode{}, errors.New("none of the requested countries currently has a usable Tor exit node")
+}
+
+func (c *ExitCatalog) bestCandidate(countries []string, policy string, requireMeasured bool) (ExitNode, bool) {
+	var candidates []ExitNode
+	for _, code := range countries {
+		nodes := c.NodesForCountry(code)
+		if policy == "failover" && len(nodes) > 0 {
+			for _, node := range nodes {
+				if !requireMeasured || node.LatencyMS >= 0 {
+					return node, true
+				}
+			}
+			if !requireMeasured {
+				return nodes[0], true
+			}
+		}
+		for _, node := range nodes {
+			if !requireMeasured || node.LatencyMS >= 0 {
+				candidates = append(candidates, node)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return ExitNode{}, false
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := latencyRank(candidates[i].LatencyMS), latencyRank(candidates[j].LatencyMS)
+		if left != right {
+			return left < right
+		}
+		if candidates[i].LatencyMS >= 0 && candidates[i].LatencyMS != candidates[j].LatencyMS {
+			return candidates[i].LatencyMS < candidates[j].LatencyMS
+		}
+		return candidates[i].ConsensusWeight > candidates[j].ConsensusWeight
+	})
+	return candidates[0], true
+}
+
 func (c *ExitCatalog) StartLatencyChecks(code string) {
-	for _, node := range c.NodesForCountry(code) {
+	c.startLatencyChecks(code, 0)
+}
+
+func (c *ExitCatalog) startLatencyChecks(code string, limit int) {
+	nodes := c.NodesForCountry(code)
+	if limit > 0 && len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+	for _, node := range nodes {
 		if !node.LatencyChecked.IsZero() && time.Since(node.LatencyChecked) < 5*time.Minute {
 			continue
 		}

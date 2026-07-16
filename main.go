@@ -58,6 +58,7 @@ func main() {
 			stop()
 		}
 	}()
+	manager.StartCountryProxies(ctx)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
@@ -130,6 +131,26 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 	})
 	mux.HandleFunc("GET /api/settings/runtime", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, configStore.Runtime())
+	})
+	mux.HandleFunc("GET /api/settings/client", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, configStore.Client(cfg.ClientAPIKey != ""))
+	})
+	mux.HandleFunc("PUT /api/settings/client", func(w http.ResponseWriter, r *http.Request) {
+		var update ClientUpdate
+		if err := decodeJSON(r, &update); err != nil {
+			writeError(w, err)
+			return
+		}
+		generated, err := configStore.UpdateClient(update)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		response := map[string]any{"settings": configStore.Client(cfg.ClientAPIKey != ""), "restart_required": true}
+		if generated != "" {
+			response["api_key"] = generated
+		}
+		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("PUT /api/settings/runtime", func(w http.ResponseWriter, r *http.Request) {
 		var input RuntimeSettings
@@ -250,13 +271,80 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 		}
 		writeJSON(w, http.StatusAccepted, manager.State())
 	})
+	mux.HandleFunc("GET /api/v1/countries", func(w http.ResponseWriter, r *http.Request) {
+		if err := catalog.EnsureFresh(r.Context()); err != nil {
+			writeError(w, err)
+			return
+		}
+		countries := catalog.Countries()
+		result := make([]map[string]any, 0, len(countries))
+		for _, country := range countries {
+			port, _ := countryPort(cfg.CountryProxyPort, country.Code)
+			result = append(result, map[string]any{"code": country.Code, "name": country.Name, "continent": country.Continent, "node_count": country.NodeCount, "socks5_port": port})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"countries": result, "policies": []string{"lowest_latency", "failover"}})
+	})
+	mux.HandleFunc("POST /api/v1/routes", func(w http.ResponseWriter, r *http.Request) {
+		var input RouteRequest
+		if err := decodeJSON(r, &input); err != nil {
+			writeError(w, err)
+			return
+		}
+		candidates := input.Countries
+		if input.Country != "" {
+			candidates = append([]string{input.Country}, candidates...)
+		}
+		if err := catalog.EnsureFresh(r.Context()); err != nil {
+			writeError(w, err)
+			return
+		}
+		node, err := catalog.SelectNode(r.Context(), candidates, input.Policy)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := manager.StartNode(node); err != nil {
+			writeError(w, err)
+			return
+		}
+		if _, err := manager.EnsureCountryProxy(node.CountryCode); err != nil {
+			writeError(w, err)
+			return
+		}
+		route, _ := clientRouteForRequest(manager, cfg, r, node.CountryCode)
+		route.LatencyMS = node.LatencyMS
+		writeJSON(w, http.StatusAccepted, route)
+	})
+	mux.HandleFunc("GET /api/v1/routes/{code}", func(w http.ResponseWriter, r *http.Request) {
+		route, err := clientRouteForRequest(manager, cfg, r, r.PathValue("code"))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, route)
+	})
+	mux.HandleFunc("DELETE /api/v1/routes/{code}", func(w http.ResponseWriter, r *http.Request) {
+		if err := manager.Stop(r.PathValue("code")); err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"stopping": true})
+	})
 	assets, _ := fs.Sub(webFiles, "web")
 	mux.Handle("/", http.FileServer(http.FS(assets)))
-	return securityHeaders(authAPI(mux, authStore))
+	return securityHeaders(authAPI(mux, authStore, cfg.ClientAPIKey))
 }
 
-func authAPI(next http.Handler, authStore *AuthStore) http.Handler {
+func authAPI(next http.Handler, authStore *AuthStore, clientAPIKey string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			if !validBearerToken(r, clientAPIKey) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "valid client API Bearer token required"})
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") && !publicAPIPath(r.URL.Path) {
 			if !authStore.Configured() {
 				writeJSON(w, http.StatusPreconditionRequired, map[string]string{"error": "administrator password has not been configured"})

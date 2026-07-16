@@ -36,6 +36,19 @@ func TestPortsAreStable(t *testing.T) {
 	}
 }
 
+func TestCountryProxyPortsAreStable(t *testing.T) {
+	tests := map[string]int{"aa": 20000, "jp": 20249, "us": 20538, "zz": 20675}
+	for code, want := range tests {
+		got, err := countryPort(20000, code)
+		if err != nil {
+			t.Fatalf("countryPort(%q): %v", code, err)
+		}
+		if got != want {
+			t.Fatalf("countryPort(%q) = %d, want %d", code, got, want)
+		}
+	}
+}
+
 func TestStateAPIAndWebPage(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.StateDir = t.TempDir()
@@ -47,9 +60,15 @@ func TestStateAPIAndWebPage(t *testing.T) {
 	configStore := NewConfigStore(filepath.Join(t.TempDir(), "config.json"), cfg)
 	manager := NewManager(cfg)
 	handler := routes(manager, NewExitCatalog(cfg), configStore, authStore, cfg)
-
-	request := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/countries", nil)
 	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("client API without key returned %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusPreconditionRequired {
 		t.Fatalf("unconfigured API returned %d", response.Code)
@@ -126,6 +145,25 @@ func TestRuntimeUpdateDoesNotPersistEnvironmentProxy(t *testing.T) {
 	}
 }
 
+func TestGeneratedClientAPIKeyIsSaved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store := NewConfigStore(path, defaultConfig())
+	key, err := store.UpdateClient(ClientUpdate{Host: "127.0.0.1", BasePort: 21000, RegenerateKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) < 40 {
+		t.Fatal("generated client API key is too short")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), key) {
+		t.Fatal("generated client API key was not saved")
+	}
+}
+
 func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	stored := defaultConfig()
@@ -142,6 +180,7 @@ func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	t.Setenv("TOR_UPSTREAM_SOCKS5", "environment.example:1080")
 	t.Setenv("TOR_UPSTREAM_USERNAME", "environment-user")
 	t.Setenv("TOR_UPSTREAM_PASSWORD", "environment-secret")
+	t.Setenv("TOR_CLIENT_API_KEY", "environment-api-key")
 
 	loaded, err := loadConfig(path)
 	if err != nil {
@@ -153,6 +192,9 @@ func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	if loaded.Effective.UpstreamSOCKS5 != "environment.example:1080" || loaded.Effective.UpstreamPassword != "environment-secret" {
 		t.Fatal("effective config did not receive environment overrides")
 	}
+	if loaded.Stored.ClientAPIKey != "" || loaded.Effective.ClientAPIKey != "environment-api-key" {
+		t.Fatal("client API key snapshots were not kept separate")
+	}
 
 	store := NewConfigStore(path, loaded.Stored)
 	if err := store.UpdateMaxRunning(7); err != nil {
@@ -162,7 +204,7 @@ func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(saved), "environment-secret") || !strings.Contains(string(saved), "stored-secret") {
+	if strings.Contains(string(saved), "environment-secret") || strings.Contains(string(saved), "environment-api-key") || !strings.Contains(string(saved), "stored-secret") {
 		t.Fatal("saved config did not preserve the stored snapshot")
 	}
 }

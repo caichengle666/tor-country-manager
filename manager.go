@@ -42,14 +42,17 @@ type Instance struct {
 }
 
 type Manager struct {
-	cfg       Config
-	mu        sync.RWMutex
-	instances map[string]*Instance
-	active    string
+	cfg              Config
+	mu               sync.RWMutex
+	instances        map[string]*Instance
+	active           string
+	countryProxyCtx  context.Context
+	countryListeners map[string]net.Listener
+	countryListenMu  sync.Mutex
 }
 
 func NewManager(cfg Config) *Manager {
-	m := &Manager{cfg: cfg, instances: make(map[string]*Instance)}
+	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), countryListeners: make(map[string]net.Listener)}
 	for index, country := range cfg.Countries {
 		country.Code = normalizeCode(country.Code)
 		m.instances[country.Code] = &Instance{
@@ -356,6 +359,14 @@ func (m *Manager) ensureCountry(country Country) (*Instance, error) {
 }
 
 func (m *Manager) ActivateNode(node ExitNode) error {
+	return m.startNode(node, true)
+}
+
+func (m *Manager) StartNode(node ExitNode) error {
+	return m.startNode(node, false)
+}
+
+func (m *Manager) startNode(node ExitNode, activate bool) error {
 	if !fingerprintPattern.MatchString(node.Fingerprint) {
 		return errors.New("invalid Tor relay fingerprint")
 	}
@@ -368,9 +379,11 @@ func (m *Manager) ActivateNode(node ExitNode) error {
 	needsStop := instance.cmd != nil && !alreadyRunning
 	m.mu.RUnlock()
 	if alreadyRunning {
-		m.mu.Lock()
-		m.active = instance.Country.Code
-		m.mu.Unlock()
+		if activate {
+			m.mu.Lock()
+			m.active = instance.Country.Code
+			m.mu.Unlock()
+		}
 		return nil
 	}
 	if needsStop {
@@ -399,7 +412,22 @@ func (m *Manager) ActivateNode(node ExitNode) error {
 	instance.SelectedIP = node.IP
 	instance.SelectedNode = node.Nickname
 	m.mu.Unlock()
-	return m.Activate(instance.Country.Code)
+	if activate {
+		return m.Activate(instance.Country.Code)
+	}
+	return m.Start(instance.Country.Code)
+}
+
+func (m *Manager) Instance(code string) (Instance, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	instance, ok := m.instances[normalizeCode(code)]
+	if !ok {
+		return Instance{}, false
+	}
+	copy := *instance
+	copy.cmd = nil
+	return copy, true
 }
 
 var fingerprintPattern = regexp.MustCompile(`^[A-Fa-f0-9]{40}$`)

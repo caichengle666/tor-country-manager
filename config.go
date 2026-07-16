@@ -25,8 +25,11 @@ type Config struct {
 	GeoIPFile        string    `json:"geoip_file"`
 	GeoIPv6File      string    `json:"geoip6_file"`
 	BaseSocksPort    int       `json:"base_socks_port"`
+	CountryProxyHost string    `json:"country_proxy_host"`
+	CountryProxyPort int       `json:"country_proxy_base_port"`
 	MaxRunning       int       `json:"max_running"`
 	AuthToken        string    `json:"auth_token,omitempty"`
+	ClientAPIKey     string    `json:"client_api_key,omitempty"`
 	UpstreamSOCKS5   string    `json:"upstream_socks5,omitempty"`
 	UpstreamUsername string    `json:"upstream_username,omitempty"`
 	UpstreamPassword string    `json:"upstream_password,omitempty"`
@@ -40,14 +43,16 @@ type LoadedConfig struct {
 
 func defaultConfig() Config {
 	return Config{
-		ListenAddress: "127.0.0.1:8080",
-		ProxyAddress:  "127.0.0.1:1080",
-		TorBinary:     "/usr/bin/tor",
-		StateDir:      "/var/lib/tor-country-manager",
-		GeoIPFile:     "/usr/share/tor/geoip",
-		GeoIPv6File:   "/usr/share/tor/geoip6",
-		BaseSocksPort: 19050,
-		MaxRunning:    10,
+		ListenAddress:    "127.0.0.1:8080",
+		ProxyAddress:     "127.0.0.1:1080",
+		TorBinary:        "/usr/bin/tor",
+		StateDir:         "/var/lib/tor-country-manager",
+		GeoIPFile:        "/usr/share/tor/geoip",
+		GeoIPv6File:      "/usr/share/tor/geoip6",
+		BaseSocksPort:    19050,
+		CountryProxyHost: "127.0.0.1",
+		CountryProxyPort: 20000,
+		MaxRunning:       10,
 		Countries: []Country{
 			{Code: "us", Name: "美国"},
 			{Code: "jp", Name: "日本"},
@@ -78,6 +83,9 @@ func loadConfig(path string) (LoadedConfig, error) {
 	if token := os.Getenv("TOR_MANAGER_TOKEN"); token != "" {
 		effective.AuthToken = token
 	}
+	if key := os.Getenv("TOR_CLIENT_API_KEY"); key != "" {
+		effective.ClientAPIKey = key
+	}
 	if proxy := os.Getenv("TOR_UPSTREAM_SOCKS5"); proxy != "" {
 		effective.UpstreamSOCKS5 = proxy
 		effective.UpstreamUsername = os.Getenv("TOR_UPSTREAM_USERNAME")
@@ -90,13 +98,43 @@ func loadConfig(path string) (LoadedConfig, error) {
 }
 
 var countryCodePattern = regexp.MustCompile(`^[a-zA-Z]{2}$`)
+var proxyHostPattern = regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
+
+func rangesOverlap(firstStart, firstEnd, secondStart, secondEnd int) bool {
+	return firstStart <= secondEnd && secondStart <= firstEnd
+}
+
+func countryPort(base int, code string) (int, error) {
+	code = normalizeCode(code)
+	if !countryCodePattern.MatchString(code) {
+		return 0, fmt.Errorf("invalid country code %q", code)
+	}
+	index := int(code[0]-'a')*26 + int(code[1]-'a')
+	return base + index, nil
+}
 
 func (c Config) validate() error {
 	if c.ListenAddress == "" || c.ProxyAddress == "" || c.TorBinary == "" || c.StateDir == "" {
 		return errors.New("listen_address, proxy_address, tor_binary and state_dir are required")
 	}
-	if c.BaseSocksPort < 1024 || c.BaseSocksPort+len(c.Countries) >= 65535 {
+	if c.BaseSocksPort < 1024 || c.BaseSocksPort+675 >= 65535 {
 		return errors.New("base_socks_port is outside the usable range")
+	}
+	proxyHost := strings.TrimSpace(c.CountryProxyHost)
+	if proxyHost == "" || (net.ParseIP(proxyHost) == nil && !proxyHostPattern.MatchString(proxyHost)) {
+		return errors.New("country_proxy_host must be an IP address or hostname without a port")
+	}
+	if c.CountryProxyPort < 1024 || c.CountryProxyPort+675 >= 65535 {
+		return errors.New("country_proxy_base_port is outside the usable range")
+	}
+	if rangesOverlap(c.BaseSocksPort, c.BaseSocksPort+675, c.CountryProxyPort, c.CountryProxyPort+675) {
+		return errors.New("internal and country proxy port ranges overlap")
+	}
+	if strings.ContainsAny(c.ClientAPIKey, "\r\n") {
+		return errors.New("client API key cannot contain newlines")
+	}
+	if c.ClientAPIKey != "" && (len(c.ClientAPIKey) < 16 || len(c.ClientAPIKey) > 255) {
+		return errors.New("client API key must be between 16 and 255 characters")
 	}
 	if c.MaxRunning < 1 || c.MaxRunning > 32 {
 		return errors.New("max_running must be between 1 and 32")

@@ -19,6 +19,8 @@
 - 首次使用设置Web管理员密码，后续使用安全会话登录
 - 管理页面可修改上游SOCKS5地址、用户名和密码
 - 管理页面可设置最多同时在线国家数（1～32），保存后立即生效
+- 客户端API可从一个或多个候选国家中自动选择最低延迟出口
+- 每个国家具有重启后不变的独立SOCKS5端口，并使用API密钥认证
 
 本项目与 The Tor Project 没有隶属或背书关系。Tor程序和相关组件继续使用它们各自的许可证。
 
@@ -41,7 +43,7 @@ ghcr.io/caichengle666/tor-country-manager:latest
 
 Web 页面和 SOCKS5 代理默认只监听 `127.0.0.1`。不要把无认证 SOCKS5 端口或 Tor 内部端口直接暴露到公网。远程使用时推荐 SSH 隧道或 VPN。
 
-管理员密码以 PBKDF2-SHA256 加盐哈希保存在状态目录的 `web-password.hash`，不会以明文写入配置。上游 SOCKS5 密码按用户要求保存在 `config.json`，请限制该文件的读取权限。通过Web修改代理配置后需要重启管理器才能生效。
+管理员密码以 PBKDF2-SHA256 加盐哈希保存在状态目录的 `web-password.hash`，不会以明文写入配置。上游 SOCKS5 密码和客户端API密钥保存在 `config.json`，请限制该文件的读取权限。通过Web修改代理或客户端API配置后需要重启管理器才能生效。也可以使用环境变量 `TOR_CLIENT_API_KEY` 注入客户端密钥，此时环境变量不会写回配置文件。
 
 切换国家只影响新连接，现有 TCP 连接不会被迁移。`ExitNodes` 和 GeoIP 分类不保证某个国家始终有可用出口，也不保证地理信息绝对准确。
 
@@ -83,6 +85,37 @@ ssh -L 8080:127.0.0.1:8080 \
 curl --socks5-hostname 127.0.0.1:1080 https://check.torproject.org/api/ip
 ```
 
+## 客户端多国家自动选择
+
+先在Web管理设置中生成客户端API密钥并重启管理器。查询当前可选国家：
+
+```bash
+curl -H "Authorization: Bearer API密钥" \
+  http://127.0.0.1:8080/api/v1/countries
+```
+
+从美国、日本、新加坡中自动选择TCP延迟最低的节点：
+
+```bash
+curl -X POST -H "Authorization: Bearer API密钥" \
+  -H "Content-Type: application/json" \
+  -d '{"countries":["us","jp","sg"],"policy":"lowest_latency"}' \
+  http://127.0.0.1:8080/api/v1/routes
+```
+
+按填写顺序故障转移可将策略改为 `failover`。返回结果中的 `socks5_address` 是该国家的固定入口；SOCKS5用户名为国家代码，密码为同一个客户端API密钥。首次启动通常会返回 `ready: false`，客户端应查询状态，直到 `ready: true`：
+
+```bash
+curl -H "Authorization: Bearer API密钥" \
+  http://127.0.0.1:8080/api/v1/routes/us
+
+curl --proxy-user 'us:API密钥' \
+  --socks5-hostname 127.0.0.1:20538 \
+  https://check.torproject.org/api/ip
+```
+
+固定端口按两位国家代码计算，默认范围为 `20000-20675`。例如美国 `us` 为 `20538`，日本 `jp` 为 `20249`。统一入口 `1080` 仍跟随Web当前出口，不受客户端API选择影响。
+
 查看服务：
 
 ```bash
@@ -114,6 +147,14 @@ docker compose down
 ```
 
 不要把 `1080` 端口无认证地映射到公网。
+
+Docker如需使用国家入口，应只映射实际需要的端口，例如美国和日本：
+
+```yaml
+ports:
+  - "127.0.0.1:20538:20538"
+  - "127.0.0.1:20249:20249"
+```
 
 ## macOS
 

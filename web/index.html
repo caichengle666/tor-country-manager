@@ -64,6 +64,15 @@
         <div class="muted">保存后立即生效。调低上限时会保留当前出口，并停止最早启动的其他实例。</div>
         <button type="submit">保存在线数量</button>
       </form><div id="runtime-message" class="message"></div></section>
+      <section class="form-section"><h3>客户端多国家代理</h3><form id="client-form" class="form">
+        <label>国家代理监听地址<input id="client-host" placeholder="127.0.0.1 或 0.0.0.0" required></label>
+        <label>国家代理基础端口<input id="client-base-port" type="number" min="1024" max="64859" step="1" required></label>
+        <label>自定义客户端API密钥<input id="client-api-key" type="password" autocomplete="new-password" placeholder="留空表示保持原密钥"></label>
+        <label class="check"><input id="client-regenerate" type="checkbox">自动生成新的安全密钥</label>
+        <label class="check"><input id="client-clear" type="checkbox">关闭客户端API并清除密钥</label>
+        <div class="muted">客户端使用Bearer密钥调用API；连接国家SOCKS5时，用户名为国家代码，密码为同一个API密钥。修改后需要重启。</div>
+        <button type="submit">保存客户端代理配置</button>
+      </form><div id="client-message" class="message"></div></section>
       <section class="form-section"><h3>上游 SOCKS5 代理</h3><form id="upstream-form" class="form">
         <label>主机名和端口<input id="upstream-address" placeholder="nas.example.com:1080"></label>
         <label>用户名<input id="upstream-username" autocomplete="username"></label>
@@ -129,7 +138,7 @@ function renderNodes(nodes){
 }
 function closeModal(){openCountry='';modal.classList.remove('open');clearInterval(nodePoll);nodePoll=null}
 async function openSettings(){
-  $('#runtime-message').textContent='';$('#upstream-message').textContent='';$('#password-message').textContent='';const [runtime,settings]=await Promise.all([api('/api/settings/runtime'),api('/api/settings/upstream')]);$('#max-running').value=runtime.max_running;$('#upstream-address').value=settings.address||'';$('#upstream-username').value=settings.username||'';$('#upstream-password').value='';$('#upstream-password').placeholder=settings.has_password?'已保存密码，留空表示保持不变':'输入代理密码';$('#upstream-clear').checked=false;settingsModal.classList.add('open');
+  $('#runtime-message').textContent='';$('#client-message').textContent='';$('#upstream-message').textContent='';$('#password-message').textContent='';const [runtime,settings,client]=await Promise.all([api('/api/settings/runtime'),api('/api/settings/upstream'),api('/api/settings/client')]);$('#max-running').value=runtime.max_running;$('#client-host').value=client.host||'127.0.0.1';$('#client-base-port').value=client.base_port||20000;$('#client-api-key').value='';$('#client-api-key').placeholder=client.has_api_key?'已配置密钥，留空表示保持不变':'输入密钥或选择自动生成';$('#client-regenerate').checked=false;$('#client-clear').checked=false;$('#upstream-address').value=settings.address||'';$('#upstream-username').value=settings.username||'';$('#upstream-password').value='';$('#upstream-password').placeholder=settings.has_password?'已保存密码，留空表示保持不变':'输入代理密码';$('#upstream-clear').checked=false;settingsModal.classList.add('open');
 }
 function closeSettings(){settingsModal.classList.remove('open')}
 countriesEl.onclick=async event=>{const button=event.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='nodes'){try{await openNodes(button.dataset.code,button.dataset.name)}catch(error){showError(error)}return}button.disabled=true;try{stateCache=await api(`/api/countries/${button.dataset.code}/stop`,{method:'POST'});renderCountries()}catch(error){showError(error)}finally{button.disabled=false}};
@@ -137,6 +146,7 @@ nodeList.onclick=async event=>{const button=event.target.closest('button[data-fi
 $('#modal-close').onclick=closeModal;modal.onclick=event=>{if(event.target===modal)closeModal()};
 $('#settings').onclick=()=>openSettings().catch(showError);$('#settings-close').onclick=closeSettings;settingsModal.onclick=event=>{if(event.target===settingsModal)closeSettings()};
 $('#runtime-form').onsubmit=async event=>{event.preventDefault();const limit=Number($('#max-running').value);try{const result=await api('/api/settings/runtime',{method:'PUT',body:JSON.stringify({max_running:limit})});stateCache.max_running=result.settings.max_running;$('#runtime-message').textContent=`已生效：最多同时在线 ${result.settings.max_running} 个国家`}catch(error){$('#runtime-message').textContent=error.message}};
+$('#client-form').onsubmit=async event=>{event.preventDefault();const key=$('#client-api-key').value;const update={host:$('#client-host').value.trim(),base_port:Number($('#client-base-port').value),regenerate_key:$('#client-regenerate').checked,clear_api_key:$('#client-clear').checked};if(key)update.api_key=key;try{const result=await api('/api/settings/client',{method:'PUT',body:JSON.stringify(update)});$('#client-message').textContent=result.api_key?`新API密钥（只显示这一次，请复制）：${result.api_key}`:'已保存，请重启管理器使配置生效';$('#client-api-key').value='';$('#client-regenerate').checked=false;$('#client-clear').checked=false}catch(error){$('#client-message').textContent=error.message}};
 $('#upstream-form').onsubmit=async event=>{event.preventDefault();const password=$('#upstream-password').value;const update={address:$('#upstream-address').value.trim(),username:$('#upstream-username').value.trim(),clear_password:$('#upstream-clear').checked};if(password)update.password=password;try{const result=await api('/api/settings/upstream',{method:'PUT',body:JSON.stringify(update)});$('#upstream-message').textContent=result.restart_required?'已保存到 config.json，请重启管理器使配置生效':'已保存'}catch(error){$('#upstream-message').textContent=error.message}};
 $('#password-form').onsubmit=async event=>{event.preventDefault();const current=$('#current-password').value,replacement=$('#new-password').value,confirm=$('#confirm-password').value;if(replacement!==confirm){$('#password-message').textContent='两次输入的新密码不一致';return}try{await api('/api/settings/password',{method:'PUT',body:JSON.stringify({current_password:current,new_password:replacement})});$('#password-message').textContent='管理密码已修改';$('#current-password').value='';$('#new-password').value='';$('#confirm-password').value=''}catch(error){$('#password-message').textContent=error.message}};
 $('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST'});showAuth('login')}catch(error){showError(error)}};

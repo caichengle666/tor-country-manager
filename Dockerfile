@@ -18,6 +18,5 @@ COPY deploy/docker/config.json /app/config.default.json
 COPY --chmod=0755 deploy/docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 USER tor-manager
 VOLUME ["/data"]
-EXPOSE 8080 1080
+EXPOSE 8080 1080 20000-20675
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,20 @@ type UpstreamSettings struct {
 
 type RuntimeSettings struct {
 	MaxRunning int `json:"max_running"`
+}
+
+type ClientSettings struct {
+	Host      string `json:"host"`
+	BasePort  int    `json:"base_port"`
+	HasAPIKey bool   `json:"has_api_key"`
+}
+
+type ClientUpdate struct {
+	Host          string  `json:"host"`
+	BasePort      int     `json:"base_port"`
+	APIKey        *string `json:"api_key,omitempty"`
+	ClearAPIKey   bool    `json:"clear_api_key,omitempty"`
+	RegenerateKey bool    `json:"regenerate_key,omitempty"`
 }
 
 type UpstreamUpdate struct {
@@ -62,6 +78,46 @@ func (s *ConfigStore) Upstream() UpstreamSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return UpstreamSettings{Address: s.cfg.UpstreamSOCKS5, Username: s.cfg.UpstreamUsername, HasPassword: s.cfg.UpstreamPassword != ""}
+}
+
+func (s *ConfigStore) Client(effectiveHasAPIKey bool) ClientSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ClientSettings{Host: s.cfg.CountryProxyHost, BasePort: s.cfg.CountryProxyPort, HasAPIKey: effectiveHasAPIKey || s.cfg.ClientAPIKey != ""}
+}
+
+func (s *ConfigStore) UpdateClient(update ClientUpdate) (string, error) {
+	update.Host = strings.TrimSpace(update.Host)
+	providedKey := update.APIKey != nil && strings.TrimSpace(*update.APIKey) != ""
+	if (update.RegenerateKey && update.ClearAPIKey) || (providedKey && (update.RegenerateKey || update.ClearAPIKey)) {
+		return "", errors.New("choose only one API key action")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.cfg
+	next.CountryProxyHost = update.Host
+	next.CountryProxyPort = update.BasePort
+	generated := ""
+	if update.RegenerateKey {
+		value := make([]byte, 32)
+		if _, err := rand.Read(value); err != nil {
+			return "", fmt.Errorf("generate client API key: %w", err)
+		}
+		generated = base64.RawURLEncoding.EncodeToString(value)
+		next.ClientAPIKey = generated
+	} else if update.ClearAPIKey {
+		next.ClientAPIKey = ""
+	} else if providedKey {
+		next.ClientAPIKey = strings.TrimSpace(*update.APIKey)
+	}
+	if err := next.validate(); err != nil {
+		return "", err
+	}
+	if err := s.saveLocked(next); err != nil {
+		return "", err
+	}
+	s.cfg = next
+	return generated, nil
 }
 
 func (s *ConfigStore) UpdateUpstream(update UpstreamUpdate) error {
