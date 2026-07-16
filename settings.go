@@ -33,18 +33,7 @@ type UpstreamUpdate struct {
 	ClearPassword bool    `json:"clear_password,omitempty"`
 }
 
-func NewConfigStore(path string, cfg Config) *ConfigStore {
-	stored := cfg
-	if b, err := os.ReadFile(path); err == nil {
-		stored = defaultConfig()
-		if json.Unmarshal(b, &stored) != nil {
-			stored = cfg
-		}
-	} else if os.Getenv("TOR_UPSTREAM_SOCKS5") != "" {
-		stored.UpstreamSOCKS5 = ""
-		stored.UpstreamUsername = ""
-		stored.UpstreamPassword = ""
-	}
+func NewConfigStore(path string, stored Config) *ConfigStore {
 	return &ConfigStore{path: path, cfg: stored}
 }
 
@@ -62,8 +51,11 @@ func (s *ConfigStore) UpdateMaxRunning(limit int) error {
 	if err := next.validate(); err != nil {
 		return err
 	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
 	s.cfg = next
-	return s.saveLocked()
+	return nil
 }
 
 func (s *ConfigStore) Upstream() UpstreamSettings {
@@ -91,8 +83,11 @@ func (s *ConfigStore) UpdateUpstream(update UpstreamUpdate) error {
 	if err := next.validate(); err != nil {
 		return err
 	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
 	s.cfg = next
-	return s.saveLocked()
+	return nil
 }
 
 func (s *ConfigStore) ClearLegacyAuth() error {
@@ -101,15 +96,20 @@ func (s *ConfigStore) ClearLegacyAuth() error {
 	if s.cfg.AuthToken == "" {
 		return nil
 	}
-	s.cfg.AuthToken = ""
-	return s.saveLocked()
+	next := s.cfg
+	next.AuthToken = ""
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.cfg = next
+	return nil
 }
 
-func (s *ConfigStore) saveLocked() error {
+func (s *ConfigStore) saveLocked(cfg Config) error {
 	if s.path == "" {
 		return errors.New("configuration path is empty")
 	}
-	b, err := json.MarshalIndent(s.cfg, "", "  ")
+	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -117,7 +117,28 @@ func (s *ConfigStore) saveLocked() error {
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return fmt.Errorf("create configuration directory: %w", err)
 	}
-	if err := os.WriteFile(s.path, append(b, '\n'), 0o640); err != nil {
+	temporary, err := os.CreateTemp(directory, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary configuration: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o640); err != nil {
+		temporary.Close()
+		return fmt.Errorf("set temporary configuration permissions: %w", err)
+	}
+	if _, err := temporary.Write(append(b, '\n')); err != nil {
+		temporary.Close()
+		return fmt.Errorf("write temporary configuration: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return fmt.Errorf("sync temporary configuration: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close temporary configuration: %w", err)
+	}
+	if err := replaceFile(temporaryPath, s.path); err != nil {
 		return fmt.Errorf("save configuration: %w", err)
 	}
 	return nil

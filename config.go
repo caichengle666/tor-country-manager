@@ -33,6 +33,11 @@ type Config struct {
 	Countries        []Country `json:"countries"`
 }
 
+type LoadedConfig struct {
+	Stored    Config
+	Effective Config
+}
+
 func defaultConfig() Config {
 	return Config{
 		ListenAddress: "127.0.0.1:8080",
@@ -58,30 +63,30 @@ func defaultConfig() Config {
 	}
 }
 
-func loadConfig(path string) (Config, error) {
-	cfg := defaultConfig()
+func loadConfig(path string) (LoadedConfig, error) {
+	stored := defaultConfig()
 	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		if token := os.Getenv("TOR_MANAGER_TOKEN"); token != "" {
-			cfg.AuthToken = token
+	if err == nil {
+		if err := json.Unmarshal(b, &stored); err != nil {
+			return LoadedConfig{}, fmt.Errorf("parse config: %w", err)
 		}
-		return cfg, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return LoadedConfig{}, fmt.Errorf("read config: %w", err)
 	}
-	if err != nil {
-		return Config{}, fmt.Errorf("read config: %w", err)
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse config: %w", err)
-	}
+
+	effective := stored
 	if token := os.Getenv("TOR_MANAGER_TOKEN"); token != "" {
-		cfg.AuthToken = token
+		effective.AuthToken = token
 	}
 	if proxy := os.Getenv("TOR_UPSTREAM_SOCKS5"); proxy != "" {
-		cfg.UpstreamSOCKS5 = proxy
-		cfg.UpstreamUsername = os.Getenv("TOR_UPSTREAM_USERNAME")
-		cfg.UpstreamPassword = os.Getenv("TOR_UPSTREAM_PASSWORD")
+		effective.UpstreamSOCKS5 = proxy
+		effective.UpstreamUsername = os.Getenv("TOR_UPSTREAM_USERNAME")
+		effective.UpstreamPassword = os.Getenv("TOR_UPSTREAM_PASSWORD")
 	}
-	return cfg, cfg.validate()
+	if err := effective.validate(); err != nil {
+		return LoadedConfig{}, err
+	}
+	return LoadedConfig{Stored: stored, Effective: effective}, nil
 }
 
 var countryCodePattern = regexp.MustCompile(`^[a-zA-Z]{2}$`)

@@ -34,17 +34,18 @@ func main() {
 		fmt.Println("wrote", *configPath)
 		return
 	}
-	cfg, err := loadConfig(*configPath)
+	loaded, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
+	cfg := loaded.Effective
 	if err := os.MkdirAll(cfg.StateDir, 0o750); err != nil {
 		log.Fatal(err)
 	}
 
 	manager := NewManager(cfg)
 	catalog := NewExitCatalog(cfg)
-	configStore := NewConfigStore(*configPath, cfg)
+	configStore := NewConfigStore(*configPath, loaded.Stored)
 	authStore, err := NewAuthStore(cfg)
 	if err != nil {
 		log.Fatal(err)

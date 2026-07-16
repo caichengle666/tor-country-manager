@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -102,12 +103,17 @@ func TestPasswordHash(t *testing.T) {
 
 func TestRuntimeUpdateDoesNotPersistEnvironmentProxy(t *testing.T) {
 	t.Setenv("TOR_UPSTREAM_SOCKS5", "proxy.example:1080")
-	cfg := defaultConfig()
-	cfg.UpstreamSOCKS5 = "proxy.example:1080"
-	cfg.UpstreamUsername = "environment-user"
-	cfg.UpstreamPassword = "environment-secret"
+	t.Setenv("TOR_UPSTREAM_USERNAME", "environment-user")
+	t.Setenv("TOR_UPSTREAM_PASSWORD", "environment-secret")
 	path := filepath.Join(t.TempDir(), "config.json")
-	store := NewConfigStore(path, cfg)
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Effective.UpstreamPassword != "environment-secret" {
+		t.Fatal("environment proxy was not applied to effective config")
+	}
+	store := NewConfigStore(path, loaded.Stored)
 	if err := store.UpdateMaxRunning(7); err != nil {
 		t.Fatal(err)
 	}
@@ -117,5 +123,46 @@ func TestRuntimeUpdateDoesNotPersistEnvironmentProxy(t *testing.T) {
 	}
 	if strings.Contains(string(b), "environment-secret") || strings.Contains(string(b), "environment-user") {
 		t.Fatal("environment proxy credentials were persisted")
+	}
+}
+
+func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	stored := defaultConfig()
+	stored.UpstreamSOCKS5 = "stored.example:1080"
+	stored.UpstreamUsername = "stored-user"
+	stored.UpstreamPassword = "stored-secret"
+	b, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOR_UPSTREAM_SOCKS5", "environment.example:1080")
+	t.Setenv("TOR_UPSTREAM_USERNAME", "environment-user")
+	t.Setenv("TOR_UPSTREAM_PASSWORD", "environment-secret")
+
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Stored.UpstreamSOCKS5 != "stored.example:1080" || loaded.Stored.UpstreamPassword != "stored-secret" {
+		t.Fatal("stored config was changed by environment overrides")
+	}
+	if loaded.Effective.UpstreamSOCKS5 != "environment.example:1080" || loaded.Effective.UpstreamPassword != "environment-secret" {
+		t.Fatal("effective config did not receive environment overrides")
+	}
+
+	store := NewConfigStore(path, loaded.Stored)
+	if err := store.UpdateMaxRunning(7); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "environment-secret") || !strings.Contains(string(saved), "stored-secret") {
+		t.Fatal("saved config did not preserve the stored snapshot")
 	}
 }
