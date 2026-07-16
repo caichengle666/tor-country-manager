@@ -24,6 +24,35 @@ func TestDuplicateCountryIsRejected(t *testing.T) {
 	}
 }
 
+func TestUpstreamProxySettingsRejectNewlines(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080\r\nSETCONF Unsafe=1"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("upstream proxy address with a newline was accepted")
+	}
+	cfg = defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamPassword = "secret\nvalue"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("upstream proxy password with a newline was accepted")
+	}
+}
+
+func TestUpstreamProxyCredentialsMustBePaired(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamUsername = "user"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("upstream proxy username without password was accepted")
+	}
+	cfg = defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamPassword = "password"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("upstream proxy password without username was accepted")
+	}
+}
+
 func TestPortsAreStable(t *testing.T) {
 	cfg := defaultConfig()
 	manager := NewManager(cfg)

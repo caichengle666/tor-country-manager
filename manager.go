@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -23,26 +24,29 @@ import (
 )
 
 type Instance struct {
-	Country         Country   `json:"country"`
-	SocksPort       int       `json:"socks_port"`
-	Status          string    `json:"status"`
-	ExitIP          string    `json:"exit_ip,omitempty"`
-	ExitISP         string    `json:"exit_isp,omitempty"`
-	ExitASN         string    `json:"exit_asn,omitempty"`
-	ExitCountry     string    `json:"exit_country,omitempty"`
-	ExitCountryCode string    `json:"exit_country_code,omitempty"`
-	ExitCity        string    `json:"exit_city,omitempty"`
-	SelectedIP      string    `json:"selected_ip,omitempty"`
-	SelectedNode    string    `json:"selected_node,omitempty"`
-	ExitFingerprint string    `json:"exit_fingerprint,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	StartedAt       time.Time `json:"started_at,omitempty"`
-	ActiveConnections int     `json:"active_connections"`
-	DrainingConnections int   `json:"draining_connections,omitempty"`
-	cmd             *exec.Cmd
-	stopping        bool
-	draining        bool
-	replacement     bool
+	Country             Country   `json:"country"`
+	SocksPort           int       `json:"socks_port"`
+	Status              string    `json:"status"`
+	ExitIP              string    `json:"exit_ip,omitempty"`
+	ExitISP             string    `json:"exit_isp,omitempty"`
+	ExitASN             string    `json:"exit_asn,omitempty"`
+	ExitCountry         string    `json:"exit_country,omitempty"`
+	ExitCountryCode     string    `json:"exit_country_code,omitempty"`
+	ExitCity            string    `json:"exit_city,omitempty"`
+	SelectedIP          string    `json:"selected_ip,omitempty"`
+	SelectedNode        string    `json:"selected_node,omitempty"`
+	ExitFingerprint     string    `json:"exit_fingerprint,omitempty"`
+	Error               string    `json:"error,omitempty"`
+	StartedAt           time.Time `json:"started_at,omitempty"`
+	ActiveConnections   int       `json:"active_connections"`
+	DrainingConnections int       `json:"draining_connections,omitempty"`
+	controlPort         int
+	dataDir             string
+	cancelRotation      context.CancelFunc
+	cmd                 *exec.Cmd
+	stopping            bool
+	draining            bool
+	replacement         bool
 }
 
 type Manager struct {
@@ -62,9 +66,10 @@ func NewManager(cfg Config) *Manager {
 	for index, country := range cfg.Countries {
 		country.Code = normalizeCode(country.Code)
 		m.instances[country.Code] = &Instance{
-			Country:   country,
-			SocksPort: cfg.BaseSocksPort + index,
-			Status:    "stopped",
+			Country:     country,
+			SocksPort:   cfg.BaseSocksPort + index,
+			controlPort: cfg.BaseSocksPort + 3000 + index,
+			Status:      "stopped",
 		}
 		m.allInstances[m.instances[country.Code]] = struct{}{}
 	}
@@ -99,6 +104,7 @@ func (m *Manager) Start(code string) error {
 		m.mu.Unlock()
 		return err
 	}
+	instance.dataDir = dataDir
 	torrcPath := filepath.Join(instanceDir, "torrc")
 	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
 		m.mu.Unlock()
@@ -167,6 +173,8 @@ func (m *Manager) torrc(instance *Instance, dataDir, logDir string) string {
 	fmt.Fprintf(&b, "ClientOnly 1\n")
 	fmt.Fprintf(&b, "RunAsDaemon 0\n")
 	fmt.Fprintf(&b, "SocksPort 127.0.0.1:%d\n", instance.SocksPort)
+	fmt.Fprintf(&b, "ControlPort 127.0.0.1:%d\n", instance.controlPort)
+	fmt.Fprintf(&b, "CookieAuthentication 1\n")
 	fmt.Fprintf(&b, "DataDirectory %s\n", dataDir)
 	if instance.ExitFingerprint != "" {
 		fmt.Fprintf(&b, "ExitNodes $%s\n", instance.ExitFingerprint)
@@ -177,12 +185,10 @@ func (m *Manager) torrc(instance *Instance, dataDir, logDir string) string {
 	fmt.Fprintf(&b, "AvoidDiskWrites 1\n")
 	fmt.Fprintf(&b, "Log notice file %s\n", filepath.Join(logDir, "tor.log"))
 	if m.cfg.UpstreamSOCKS5 != "" {
-		fmt.Fprintf(&b, "Socks5Proxy %s\n", m.cfg.UpstreamSOCKS5)
-		if m.cfg.UpstreamUsername != "" {
-			fmt.Fprintf(&b, "Socks5ProxyUsername %s\n", m.cfg.UpstreamUsername)
-		}
-		if m.cfg.UpstreamPassword != "" {
-			fmt.Fprintf(&b, "Socks5ProxyPassword %s\n", m.cfg.UpstreamPassword)
+		fmt.Fprintf(&b, "Socks5Proxy %s\n", torrcValue(m.cfg.UpstreamSOCKS5))
+		if m.cfg.UpstreamUsername != "" && m.cfg.UpstreamPassword != "" {
+			fmt.Fprintf(&b, "Socks5ProxyUsername %s\n", torrcValue(m.cfg.UpstreamUsername))
+			fmt.Fprintf(&b, "Socks5ProxyPassword %s\n", torrcValue(m.cfg.UpstreamPassword))
 		}
 	}
 	if m.cfg.GeoIPFile != "" {
@@ -232,6 +238,15 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 				instance.Status = "connecting"
 			}
 			m.mu.Unlock()
+			if err := m.applyUpstream(instance, m.upstreamConfig()); err != nil {
+				m.mu.Lock()
+				if instance.cmd == cmd && instance.Status == "connecting" {
+					instance.Status = "error"
+					instance.Error = "apply upstream proxy: " + err.Error()
+				}
+				m.mu.Unlock()
+				return
+			}
 			m.awaitBootstrap(instance, cmd)
 			return
 		}
@@ -311,6 +326,10 @@ func (m *Manager) drainAndStop(instance *Instance) {
 
 func (m *Manager) stopInstance(instance *Instance) {
 	m.mu.Lock()
+	if instance.cancelRotation != nil {
+		instance.cancelRotation()
+		instance.cancelRotation = nil
+	}
 	cmd := instance.cmd
 	if cmd == nil || cmd.Process == nil {
 		instance.Status = "stopped"
@@ -415,7 +434,12 @@ func (m *Manager) ensureCountry(country Country) (*Instance, error) {
 	if port >= 65535 {
 		return nil, errors.New("no internal SOCKS ports remain")
 	}
-	instance := &Instance{Country: country, SocksPort: port, Status: "stopped"}
+	instance := &Instance{
+		Country:     country,
+		SocksPort:   port,
+		controlPort: m.cfg.BaseSocksPort + 3000 + len(m.cfg.Countries),
+		Status:      "stopped",
+	}
 	m.instances[country.Code] = instance
 	m.allInstances[instance] = struct{}{}
 	m.cfg.Countries = append(m.cfg.Countries, country)
@@ -469,6 +493,10 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 	if err != nil {
 		return err
 	}
+	replacementControlPort, err := availableLocalPort()
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if current.replacement {
 		m.mu.Unlock()
@@ -479,6 +507,7 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 	replacement := &Instance{
 		Country:         current.Country,
 		SocksPort:       replacementPort,
+		controlPort:     replacementControlPort,
 		Status:          "stopped",
 		ExitFingerprint: strings.ToUpper(node.Fingerprint),
 		SelectedIP:      node.IP,
@@ -520,6 +549,7 @@ func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
 		return err
 	}
+	instance.dataDir = dataDir
 	torrcPath := filepath.Join(instanceDir, "torrc")
 	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
 		return err
@@ -598,6 +628,194 @@ func (m *Manager) drainInstance(old, current *Instance) {
 		current.DrainingConnections = 0
 	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) sendNewnym(instance *Instance) {
+	response, err := m.controlCommand(instance, "SIGNAL NEWNYM")
+	if err != nil {
+		log.Printf("circuit rotation: %s: %v", instance.Country.Code, err)
+		return
+	}
+	if strings.HasPrefix(response, "250") {
+		log.Printf("circuit rotation: new circuit for %s", instance.Country.Code)
+	} else if strings.HasPrefix(response, "514") {
+		log.Printf("circuit rotation: rate limited for %s, skipping", instance.Country.Code)
+	} else {
+		log.Printf("circuit rotation: unexpected response for %s: %s", instance.Country.Code, strings.TrimSpace(response))
+	}
+}
+
+func (m *Manager) controlCommand(instance *Instance, command string) (string, error) {
+	if instance.controlPort == 0 || instance.dataDir == "" {
+		return "", errors.New("control port is not ready")
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(instance.controlPort)), 5*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("connect control port: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	cookie, err := os.ReadFile(filepath.Join(instance.dataDir, "control_auth_cookie"))
+	if err != nil {
+		return "", fmt.Errorf("read control cookie: %w", err)
+	}
+	if _, err := fmt.Fprintf(conn, "AUTHENTICATE %x\r\n", cookie); err != nil {
+		return "", fmt.Errorf("authenticate control port: %w", err)
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read authentication response: %w", err)
+	}
+	if !strings.HasPrefix(line, "250") {
+		return "", fmt.Errorf("control authentication rejected: %s", strings.TrimSpace(line))
+	}
+	if _, err := fmt.Fprintf(conn, "%s\r\n", command); err != nil {
+		return "", fmt.Errorf("send control command: %w", err)
+	}
+	line, err = reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read control response: %w", err)
+	}
+	return line, nil
+}
+
+func controlValue(value string) string {
+	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
+	return "\"" + replacer.Replace(value) + "\""
+}
+
+func torrcValue(value string) string {
+	return controlValue(value)
+}
+
+func (m *Manager) UpdateUpstream(cfg Config) error {
+	m.mu.RLock()
+	instances := make([]*Instance, 0, len(m.instances))
+	for _, instance := range m.instances {
+		if (instance.Status == "running" || instance.Status == "connecting" || instance.Status == "error") &&
+			instance.cmd != nil && instance.cmd.Process != nil && !instance.stopping && !instance.draining {
+			instances = append(instances, instance)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, instance := range instances {
+		if err := m.applyUpstream(instance, cfg); err != nil {
+			return fmt.Errorf("apply upstream proxy to %s: %w", instance.Country.Code, err)
+		}
+		if _, err := m.controlCommand(instance, "SIGNAL NEWNYM"); err != nil {
+			return fmt.Errorf("rotate circuit for %s: %w", instance.Country.Code, err)
+		}
+		m.mu.Lock()
+		cmd := instance.cmd
+		retryBootstrap := instance.Status == "error" && cmd != nil && cmd.Process != nil
+		if retryBootstrap {
+			instance.Status = "connecting"
+			instance.Error = ""
+		}
+		m.mu.Unlock()
+		if retryBootstrap {
+			go m.awaitBootstrap(instance, cmd)
+		}
+	}
+
+	m.mu.Lock()
+	m.cfg.UpstreamSOCKS5 = cfg.UpstreamSOCKS5
+	m.cfg.UpstreamUsername = cfg.UpstreamUsername
+	m.cfg.UpstreamPassword = cfg.UpstreamPassword
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) upstreamConfig() Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg
+}
+
+func (m *Manager) applyUpstream(instance *Instance, cfg Config) error {
+	command := "RESETCONF Socks5Proxy Socks5ProxyUsername Socks5ProxyPassword"
+	if cfg.UpstreamSOCKS5 != "" {
+		if cfg.UpstreamUsername == "" {
+			response, err := m.controlCommand(instance, "RESETCONF Socks5ProxyUsername Socks5ProxyPassword")
+			if err != nil {
+				return err
+			}
+			if !strings.HasPrefix(response, "250") {
+				return errors.New(strings.TrimSpace(response))
+			}
+		}
+		command = "SETCONF Socks5Proxy=" + controlValue(cfg.UpstreamSOCKS5)
+		if cfg.UpstreamUsername != "" {
+			command += " Socks5ProxyUsername=" + controlValue(cfg.UpstreamUsername) +
+				" Socks5ProxyPassword=" + controlValue(cfg.UpstreamPassword)
+		}
+	}
+	response, err := m.controlCommand(instance, command)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(response, "250") {
+		return errors.New(strings.TrimSpace(response))
+	}
+	return nil
+}
+
+func (m *Manager) startCircuitRotation(instance *Instance) {
+	m.mu.RLock()
+	minutes := m.cfg.CircuitRotateMinutes
+	m.mu.RUnlock()
+	if minutes <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if instance.cancelRotation != nil {
+		instance.cancelRotation()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance.cancelRotation = cancel
+	m.mu.Unlock()
+	go func() {
+		ticker := time.NewTicker(time.Duration(minutes) * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.mu.RLock()
+				status := instance.Status
+				m.mu.RUnlock()
+				if status != "running" {
+					cancel()
+					return
+				}
+				m.sendNewnym(instance)
+			}
+		}
+	}()
+}
+
+func (m *Manager) RestartRotations() {
+	m.mu.RLock()
+	instances := make([]*Instance, 0)
+	for _, instance := range m.instances {
+		if instance.Status == "running" {
+			instances = append(instances, instance)
+		}
+	}
+	m.mu.RUnlock()
+	for _, instance := range instances {
+		m.startCircuitRotation(instance)
+	}
+}
+
+func (m *Manager) UpdateCircuitRotateMinutes(minutes int) {
+	m.mu.Lock()
+	m.cfg.CircuitRotateMinutes = minutes
+	m.mu.Unlock()
+	m.RestartRotations()
 }
 
 func (m *Manager) Instance(code string) (Instance, bool) {
@@ -680,6 +898,7 @@ func (m *Manager) refreshInstanceExitIP(instance *Instance) bool {
 	instance.Status = "running"
 	instance.Error = ""
 	m.mu.Unlock()
+	m.startCircuitRotation(instance)
 	m.lookupExitInfo(client, instance, result.IP)
 	return true
 }

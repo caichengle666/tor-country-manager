@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -24,7 +25,7 @@ import (
 var webFiles embed.FS
 
 func main() {
-	configPath := flag.String("config", "/var/lib/tor-country-manager/config.json", "configuration file")
+	configPath := flag.String("config", defaultConfigPath(), "configuration file")
 	writeConfig := flag.Bool("write-example-config", false, "write an example configuration and exit")
 	flag.Parse()
 	if *writeConfig {
@@ -79,6 +80,17 @@ func main() {
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
 	manager.Shutdown()
+}
+
+func defaultConfigPath() string {
+	if runtime.GOOS != "windows" {
+		return "/var/lib/tor-country-manager/config.json"
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "config.json"
+	}
+	return filepath.Join(filepath.Dir(executable), "config.json")
 }
 
 func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, authStore *AuthStore, cfg Config) http.Handler {
@@ -173,6 +185,11 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			return
 		}
 		manager.UpdateMaxRunning(input.MaxRunning)
+		if err := configStore.UpdateCircuitRotateMinutes(input.CircuitRotateMinutes); err != nil {
+			writeError(w, err)
+			return
+		}
+		manager.UpdateCircuitRotateMinutes(input.CircuitRotateMinutes)
 		writeJSON(w, http.StatusOK, map[string]any{"settings": configStore.Runtime(), "applied": true})
 	})
 	mux.HandleFunc("PUT /api/settings/upstream", func(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +202,20 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"settings": configStore.Upstream(), "restart_required": true})
+		cfg := configStore.Config()
+		managedByEnvironment := false
+		if proxy := os.Getenv("TOR_UPSTREAM_SOCKS5"); proxy != "" {
+			cfg.UpstreamSOCKS5 = proxy
+			cfg.UpstreamUsername = os.Getenv("TOR_UPSTREAM_USERNAME")
+			cfg.UpstreamPassword = os.Getenv("TOR_UPSTREAM_PASSWORD")
+			managedByEnvironment = true
+		}
+		if err := manager.UpdateUpstream(cfg); err != nil {
+			writeError(w, err)
+			return
+		}
+		catalog.UpdateUpstream(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{"settings": configStore.Upstream(), "applied": true, "managed_by_environment": managedByEnvironment})
 	})
 	mux.HandleFunc("PUT /api/settings/password", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {

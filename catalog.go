@@ -53,18 +53,32 @@ type ExitCatalog struct {
 }
 
 func NewExitCatalog(cfg Config) *ExitCatalog {
+	return &ExitCatalog{
+		cfg:        cfg,
+		client:     catalogClient(cfg),
+		nodes:      make(map[string]ExitNode),
+		latencySem: make(chan struct{}, 10),
+	}
+}
+
+func catalogClient(cfg Config) *http.Client {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	if cfg.UpstreamSOCKS5 != "" {
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return dialViaUpstreamSOCKS5(ctx, cfg.UpstreamSOCKS5, address, cfg.UpstreamUsername, cfg.UpstreamPassword)
 		}
 	}
-	return &ExitCatalog{
-		cfg:        cfg,
-		client:     &http.Client{Timeout: 35 * time.Second, Transport: transport},
-		nodes:      make(map[string]ExitNode),
-		latencySem: make(chan struct{}, 10),
-	}
+	return &http.Client{Timeout: 35 * time.Second, Transport: transport}
+}
+
+func (c *ExitCatalog) UpdateUpstream(cfg Config) {
+	c.mu.Lock()
+	c.cfg.UpstreamSOCKS5 = cfg.UpstreamSOCKS5
+	c.cfg.UpstreamUsername = cfg.UpstreamUsername
+	c.cfg.UpstreamPassword = cfg.UpstreamPassword
+	c.client = catalogClient(c.cfg)
+	c.fetchedAt = time.Time{}
+	c.mu.Unlock()
 }
 
 func (c *ExitCatalog) EnsureFresh(ctx context.Context) error {
@@ -83,11 +97,14 @@ func (c *ExitCatalog) EnsureFresh(ctx context.Context) error {
 		return nil
 	}
 
+	c.mu.RLock()
+	client := c.client
+	c.mu.RUnlock()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, onionooDetailsURL, nil)
 	if err != nil {
 		return err
 	}
-	response, err := c.client.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		c.setError(err)
 		return fmt.Errorf("load Tor exit directory: %w", err)
@@ -405,8 +422,11 @@ func (c *ExitCatalog) measureTCPLatency(address string) int {
 	started := time.Now()
 	var connection net.Conn
 	var err error
-	if c.cfg.UpstreamSOCKS5 != "" {
-		connection, err = dialViaUpstreamSOCKS5(ctx, c.cfg.UpstreamSOCKS5, address, c.cfg.UpstreamUsername, c.cfg.UpstreamPassword)
+	c.mu.RLock()
+	cfg := c.cfg
+	c.mu.RUnlock()
+	if cfg.UpstreamSOCKS5 != "" {
+		connection, err = dialViaUpstreamSOCKS5(ctx, cfg.UpstreamSOCKS5, address, cfg.UpstreamUsername, cfg.UpstreamPassword)
 	} else {
 		dialer := net.Dialer{Timeout: 4 * time.Second}
 		connection, err = dialer.DialContext(ctx, "tcp", address)

@@ -143,6 +143,41 @@ jobs:
           cp "${{ matrix.tor_bin }}" "$bundle/runtime/tor/tor${{ matrix.exe }}"
           cp "${{ matrix.geoip }}" "$bundle/runtime/data/geoip"
           cp "${{ matrix.geoip6 }}" "$bundle/runtime/data/geoip6"
+          cat > "$bundle/config.json" <<EOF
+          {
+            "listen_address": "127.0.0.1:8080",
+            "proxy_address": "127.0.0.1:1080",
+            "tor_binary": "./runtime/tor/tor${{ matrix.exe }}",
+            "state_dir": "./state",
+            "geoip_file": "./runtime/data/geoip",
+            "geoip6_file": "./runtime/data/geoip6",
+            "base_socks_port": 19050,
+            "country_proxy_host": "127.0.0.1",
+            "country_proxy_base_port": 20000,
+            "max_running": 10,
+            "drain_timeout_seconds": 120,
+            "circuit_rotate_minutes": 0,
+            "countries": [
+              {"code":"us","name":"United States"},
+              {"code":"jp","name":"Japan"},
+              {"code":"de","name":"Germany"}
+            ]
+          }
+          EOF
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cat > "$bundle/Start.bat" <<'EOF'
+          @echo off
+          cd /d "%~dp0"
+          TorCountryManager.exe -config config.json
+          EOF
+          else
+            cat > "$bundle/start.sh" <<'EOF'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          exec ./TorCountryManager -config config.json
+          EOF
+            chmod +x "$bundle/start.sh"
+          fi
           chmod +x "$bundle/TorCountryManager${{ matrix.exe }}" "$bundle/runtime/tor/tor${{ matrix.exe }}" || true
       - name: Package bundle
         shell: bash

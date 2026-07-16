@@ -1,6 +1,12 @@
-﻿package main
+package main
 
 import (
+	"bufio"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -123,7 +129,7 @@ func TestManagerMakeRoomAtLimitEvictsOldest(t *testing.T) {
 		t.Fatalf("makeRoom at limit should evict, not error: %v", err)
 	}
 	// Stop on instance with no running process sets status to "stopped" immediately
-	
+
 	manager.mu.RLock()
 	jpStatus := manager.instances["jp"].Status
 	manager.mu.RUnlock()
@@ -186,6 +192,10 @@ func TestManagerEnsureCountryCreatesNewInstance(t *testing.T) {
 	if instance.SocksPort != expectedPort {
 		t.Fatalf("SocksPort = %d, want %d", instance.SocksPort, expectedPort)
 	}
+	expectedControlPort := defaultConfig().BaseSocksPort + 3000 + originalCount
+	if instance.controlPort != expectedControlPort {
+		t.Fatalf("controlPort = %d, want %d", instance.controlPort, expectedControlPort)
+	}
 }
 
 func TestManagerEnsureCountryInvalidCode(t *testing.T) {
@@ -219,7 +229,6 @@ func TestManagerUpdateMaxRunningReducesInstances(t *testing.T) {
 	manager.mu.Unlock()
 
 	manager.UpdateMaxRunning(2)
-	
 
 	manager.mu.RLock()
 	running := 0
@@ -243,5 +252,93 @@ func TestManagerCountryNormalization(t *testing.T) {
 	}
 	if instance.Country.Code != "us" {
 		t.Fatalf("got %q, want %q", instance.Country.Code, "us")
+	}
+}
+
+func TestUpdateUpstreamUsesControlPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	directory := t.TempDir()
+	cookie := []byte{0x01, 0xab, 0xcd}
+	if err := os.WriteFile(filepath.Join(directory, "control_auth_cookie"), cookie, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commands := make(chan []string, 1)
+	go func() {
+		var received []string
+		for range 2 {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reader := bufio.NewReader(connection)
+			for range 2 {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					_ = connection.Close()
+					return
+				}
+				received = append(received, strings.TrimSpace(line))
+				if _, err := connection.Write([]byte("250 OK\r\n")); err != nil {
+					_ = connection.Close()
+					return
+				}
+			}
+			_ = connection.Close()
+		}
+		commands <- received
+	}()
+
+	manager := NewManager(defaultConfig())
+	instance := manager.instances["us"]
+	instance.Status = "running"
+	instance.cmd = &exec.Cmd{Process: &os.Process{Pid: 1}}
+	instance.controlPort = listener.Addr().(*net.TCPAddr).Port
+	instance.dataDir = directory
+	cfg := defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamUsername = "user"
+	cfg.UpstreamPassword = "pass"
+	if err := manager.UpdateUpstream(cfg); err != nil {
+		t.Fatal(err)
+	}
+	received := <-commands
+	if len(received) != 4 {
+		t.Fatalf("received %d control commands, want 4", len(received))
+	}
+	if received[0] != "AUTHENTICATE 01abcd" {
+		t.Fatalf("authentication command = %q", received[0])
+	}
+	if !strings.Contains(received[1], `Socks5Proxy="proxy.example:1080"`) || !strings.Contains(received[1], `Socks5ProxyUsername="user"`) {
+		t.Fatalf("SETCONF command = %q", received[1])
+	}
+	if received[2] != "AUTHENTICATE 01abcd" || received[3] != "SIGNAL NEWNYM" {
+		t.Fatalf("rotation commands = %q", received[2:])
+	}
+}
+
+func TestControlValueEscapesQuotesAndBackslashes(t *testing.T) {
+	if got, want := controlValue(`a"b\c`), `"a\"b\\c"`; got != want {
+		t.Fatalf("controlValue() = %q, want %q", got, want)
+	}
+}
+
+func TestTorrcEscapesUpstreamCredentials(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.UpstreamSOCKS5 = "proxy.example:1080"
+	cfg.UpstreamUsername = `user "name"`
+	cfg.UpstreamPassword = `pass\word`
+	manager := NewManager(cfg)
+	instance := manager.instances["us"]
+	torrc := manager.torrc(instance, "data", "logs")
+	if !strings.Contains(torrc, `Socks5ProxyUsername "user \"name\""`) {
+		t.Fatalf("username was not escaped in torrc: %s", torrc)
+	}
+	if !strings.Contains(torrc, `Socks5ProxyPassword "pass\\word"`) {
+		t.Fatalf("password was not escaped in torrc: %s", torrc)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -18,23 +19,24 @@ type Country struct {
 }
 
 type Config struct {
-	ListenAddress    string    `json:"listen_address"`
-	ProxyAddress     string    `json:"proxy_address"`
-	TorBinary        string    `json:"tor_binary"`
-	StateDir         string    `json:"state_dir"`
-	GeoIPFile        string    `json:"geoip_file"`
-	GeoIPv6File      string    `json:"geoip6_file"`
-	BaseSocksPort    int       `json:"base_socks_port"`
-	CountryProxyHost string    `json:"country_proxy_host"`
-	CountryProxyPort int       `json:"country_proxy_base_port"`
-	MaxRunning       int       `json:"max_running"`
-	DrainTimeoutSec  int       `json:"drain_timeout_seconds"`
-	AuthToken        string    `json:"auth_token,omitempty"`
-	ClientAPIKey     string    `json:"client_api_key,omitempty"`
-	UpstreamSOCKS5   string    `json:"upstream_socks5,omitempty"`
-	UpstreamUsername string    `json:"upstream_username,omitempty"`
-	UpstreamPassword string    `json:"upstream_password,omitempty"`
-	Countries        []Country `json:"countries"`
+	ListenAddress        string    `json:"listen_address"`
+	ProxyAddress         string    `json:"proxy_address"`
+	TorBinary            string    `json:"tor_binary"`
+	StateDir             string    `json:"state_dir"`
+	GeoIPFile            string    `json:"geoip_file"`
+	GeoIPv6File          string    `json:"geoip6_file"`
+	BaseSocksPort        int       `json:"base_socks_port"`
+	CountryProxyHost     string    `json:"country_proxy_host"`
+	CountryProxyPort     int       `json:"country_proxy_base_port"`
+	MaxRunning           int       `json:"max_running"`
+	DrainTimeoutSec      int       `json:"drain_timeout_seconds"`
+	CircuitRotateMinutes int       `json:"circuit_rotate_minutes,omitempty"`
+	AuthToken            string    `json:"auth_token,omitempty"`
+	ClientAPIKey         string    `json:"client_api_key,omitempty"`
+	UpstreamSOCKS5       string    `json:"upstream_socks5,omitempty"`
+	UpstreamUsername     string    `json:"upstream_username,omitempty"`
+	UpstreamPassword     string    `json:"upstream_password,omitempty"`
+	Countries            []Country `json:"countries"`
 }
 
 type LoadedConfig struct {
@@ -43,7 +45,7 @@ type LoadedConfig struct {
 }
 
 func defaultConfig() Config {
-	return Config{
+	config := Config{
 		ListenAddress:    "127.0.0.1:8080",
 		ProxyAddress:     "127.0.0.1:1080",
 		TorBinary:        "/usr/bin/tor",
@@ -68,6 +70,13 @@ func defaultConfig() Config {
 			{Code: "se", Name: "瑞典"},
 		},
 	}
+	if runtime.GOOS == "windows" {
+		config.TorBinary = "./runtime/tor/tor.exe"
+		config.StateDir = "./state"
+		config.GeoIPFile = "./runtime/data/geoip"
+		config.GeoIPv6File = "./runtime/data/geoip6"
+	}
+	return config
 }
 
 func loadConfig(path string) (LoadedConfig, error) {
@@ -119,7 +128,7 @@ func (c Config) validate() error {
 	if c.ListenAddress == "" || c.ProxyAddress == "" || c.TorBinary == "" || c.StateDir == "" {
 		return errors.New("listen_address, proxy_address, tor_binary and state_dir are required")
 	}
-	if c.BaseSocksPort < 1024 || c.BaseSocksPort+675 >= 65535 {
+	if c.BaseSocksPort < 1024 || c.BaseSocksPort+3675 >= 65535 {
 		return errors.New("base_socks_port is outside the usable range")
 	}
 	proxyHost := strings.TrimSpace(c.CountryProxyHost)
@@ -131,6 +140,9 @@ func (c Config) validate() error {
 	}
 	if rangesOverlap(c.BaseSocksPort, c.BaseSocksPort+675, c.CountryProxyPort, c.CountryProxyPort+675) {
 		return errors.New("internal and country proxy port ranges overlap")
+	}
+	if rangesOverlap(c.BaseSocksPort+3000, c.BaseSocksPort+3675, c.CountryProxyPort, c.CountryProxyPort+675) {
+		return errors.New("control port range overlaps with country proxy port range")
 	}
 	if strings.ContainsAny(c.ClientAPIKey, "\r\n") {
 		return errors.New("client API key cannot contain newlines")
@@ -144,18 +156,25 @@ func (c Config) validate() error {
 	if c.DrainTimeoutSec < 5 || c.DrainTimeoutSec > 3600 {
 		return errors.New("drain_timeout_seconds must be between 5 and 3600")
 	}
+	if c.CircuitRotateMinutes < 0 || c.CircuitRotateMinutes > 1440 {
+		return errors.New("circuit_rotate_minutes must be between 0 and 1440 (0 disables rotation)")
+	}
 	if c.UpstreamSOCKS5 != "" {
 		host, portText, err := net.SplitHostPort(c.UpstreamSOCKS5)
-		if err != nil || strings.TrimSpace(host) == "" {
+		host = strings.TrimSpace(host)
+		if err != nil || host == "" || (net.ParseIP(host) == nil && !proxyHostPattern.MatchString(host)) {
 			return errors.New("upstream_socks5 must use host:port format")
 		}
 		port, err := strconv.Atoi(portText)
 		if err != nil || port < 1 || port > 65535 {
 			return errors.New("upstream_socks5 has an invalid port")
 		}
-		if strings.ContainsAny(c.UpstreamUsername+c.UpstreamPassword, "\r\n") {
-			return errors.New("upstream proxy credentials cannot contain newlines")
-		}
+	}
+	if strings.ContainsAny(c.UpstreamSOCKS5+c.UpstreamUsername+c.UpstreamPassword, "\r\n") {
+		return errors.New("upstream proxy settings cannot contain newlines")
+	}
+	if (c.UpstreamUsername == "") != (c.UpstreamPassword == "") {
+		return errors.New("upstream proxy username and password must be provided together")
 	}
 	seen := make(map[string]bool)
 	for _, country := range c.Countries {
