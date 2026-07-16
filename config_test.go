@@ -164,6 +164,25 @@ func TestGeneratedClientAPIKeyIsSaved(t *testing.T) {
 	}
 }
 
+func TestClientAPIKeyUpdateAppliesImmediately(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ClientAPIKey = "original-secret-value"
+	manager := NewManager(cfg)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/countries", nil)
+	request.Header.Set("Authorization", "Bearer original-secret-value")
+	if !validBearerToken(request, manager.clientAuth) {
+		t.Fatal("original client API key was rejected")
+	}
+	manager.UpdateClientAPIKey("replacement-secret-value")
+	if validBearerToken(request, manager.clientAuth) {
+		t.Fatal("old client API key remained valid after hot update")
+	}
+	request.Header.Set("Authorization", "Bearer replacement-secret-value")
+	if !validBearerToken(request, manager.clientAuth) {
+		t.Fatal("replacement client API key was not applied")
+	}
+}
+
 func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	stored := defaultConfig()

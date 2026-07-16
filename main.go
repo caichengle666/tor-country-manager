@@ -141,12 +141,22 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			writeError(w, err)
 			return
 		}
+		restartRequired := update.Host != cfg.CountryProxyHost || update.BasePort != cfg.CountryProxyPort
 		generated, err := configStore.UpdateClient(update)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		response := map[string]any{"settings": configStore.Client(cfg.ClientAPIKey != ""), "restart_required": true}
+		effectiveKey := configStore.ClientAPIKey()
+		externalKey := os.Getenv("TOR_CLIENT_API_KEY")
+		if externalKey != "" {
+			effectiveKey = externalKey
+		}
+		manager.UpdateClientAPIKey(effectiveKey)
+		response := map[string]any{"settings": configStore.Client(effectiveKey != ""), "restart_required": restartRequired, "api_key_applied": true}
+		if externalKey != "" {
+			response["managed_by_environment"] = true
+		}
 		if generated != "" {
 			response["api_key"] = generated
 		}
@@ -332,13 +342,13 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 	})
 	assets, _ := fs.Sub(webFiles, "web")
 	mux.Handle("/", http.FileServer(http.FS(assets)))
-	return securityHeaders(authAPI(mux, authStore, cfg.ClientAPIKey))
+	return securityHeaders(authAPI(mux, authStore, manager.clientAuth))
 }
 
-func authAPI(next http.Handler, authStore *AuthStore, clientAPIKey string) http.Handler {
+func authAPI(next http.Handler, authStore *AuthStore, clientAuth *RuntimeClientAuth) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
-			if !validBearerToken(r, clientAPIKey) {
+			if !validBearerToken(r, clientAuth) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "valid client API Bearer token required"})
 				return
 			}

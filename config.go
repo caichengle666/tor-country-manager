@@ -28,6 +28,7 @@ type Config struct {
 	CountryProxyHost string    `json:"country_proxy_host"`
 	CountryProxyPort int       `json:"country_proxy_base_port"`
 	MaxRunning       int       `json:"max_running"`
+	DrainTimeoutSec  int       `json:"drain_timeout_seconds"`
 	AuthToken        string    `json:"auth_token,omitempty"`
 	ClientAPIKey     string    `json:"client_api_key,omitempty"`
 	UpstreamSOCKS5   string    `json:"upstream_socks5,omitempty"`
@@ -53,6 +54,7 @@ func defaultConfig() Config {
 		CountryProxyHost: "127.0.0.1",
 		CountryProxyPort: 20000,
 		MaxRunning:       10,
+		DrainTimeoutSec:  120,
 		Countries: []Country{
 			{Code: "us", Name: "美国"},
 			{Code: "jp", Name: "日本"},
@@ -138,6 +140,9 @@ func (c Config) validate() error {
 	}
 	if c.MaxRunning < 1 || c.MaxRunning > 32 {
 		return errors.New("max_running must be between 1 and 32")
+	}
+	if c.DrainTimeoutSec < 5 || c.DrainTimeoutSec > 3600 {
+		return errors.New("drain_timeout_seconds must be between 5 and 3600")
 	}
 	if c.UpstreamSOCKS5 != "" {
 		host, portText, err := net.SplitHostPort(c.UpstreamSOCKS5)

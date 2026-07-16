@@ -37,22 +37,28 @@ type Instance struct {
 	ExitFingerprint string    `json:"exit_fingerprint,omitempty"`
 	Error           string    `json:"error,omitempty"`
 	StartedAt       time.Time `json:"started_at,omitempty"`
+	ActiveConnections int     `json:"active_connections"`
+	DrainingConnections int   `json:"draining_connections,omitempty"`
 	cmd             *exec.Cmd
 	stopping        bool
+	draining        bool
+	replacement     bool
 }
 
 type Manager struct {
 	cfg              Config
 	mu               sync.RWMutex
 	instances        map[string]*Instance
+	allInstances     map[*Instance]struct{}
 	active           string
 	countryProxyCtx  context.Context
 	countryListeners map[string]net.Listener
 	countryListenMu  sync.Mutex
+	clientAuth       *RuntimeClientAuth
 }
 
 func NewManager(cfg Config) *Manager {
-	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), countryListeners: make(map[string]net.Listener)}
+	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), allInstances: make(map[*Instance]struct{}), countryListeners: make(map[string]net.Listener), clientAuth: NewRuntimeClientAuth(cfg.ClientAPIKey)}
 	for index, country := range cfg.Countries {
 		country.Code = normalizeCode(country.Code)
 		m.instances[country.Code] = &Instance{
@@ -60,6 +66,7 @@ func NewManager(cfg Config) *Manager {
 			SocksPort: cfg.BaseSocksPort + index,
 			Status:    "stopped",
 		}
+		m.allInstances[m.instances[country.Code]] = struct{}{}
 	}
 	return m
 }
@@ -107,6 +114,7 @@ func (m *Manager) Start(code string) error {
 		return fmt.Errorf("start tor: %w", err)
 	}
 	instance.cmd = cmd
+	m.allInstances[instance] = struct{}{}
 	instance.Status = "starting"
 	instance.Error = ""
 	instance.ExitIP = ""
@@ -129,7 +137,7 @@ func (m *Manager) makeRoom(target string) error {
 	running := 0
 	var oldest *Instance
 	for code, instance := range m.instances {
-		if instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" {
+		if instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" && instance.Status != "switching" {
 			continue
 		}
 		if code == target {
@@ -194,6 +202,7 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 		return
 	}
 	instance.cmd = nil
+	delete(m.allInstances, instance)
 	if instance.stopping {
 		instance.Status = "stopped"
 		instance.Error = ""
@@ -206,7 +215,7 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 		}
 	}
 	instance.stopping = false
-	if m.active == instance.Country.Code {
+	if current := m.instances[instance.Country.Code]; current == instance && m.active == instance.Country.Code {
 		m.active = ""
 	}
 }
@@ -239,7 +248,7 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 func (m *Manager) awaitBootstrap(instance *Instance, cmd *exec.Cmd) {
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		if m.refreshExitIP(instance.Country.Code) {
+		if m.refreshInstanceExitIP(instance) {
 			return
 		}
 		m.mu.RLock()
@@ -266,17 +275,53 @@ func (m *Manager) Stop(code string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("unknown country %q", code)
 	}
-	cmd := instance.cmd
-	if cmd == nil || cmd.Process == nil {
+	if instance.cmd == nil || instance.cmd.Process == nil {
 		instance.Status = "stopped"
 		instance.Error = ""
 		m.mu.Unlock()
 		return nil
 	}
+	if instance.draining {
+		m.mu.Unlock()
+		return nil
+	}
+	instance.draining = true
+	instance.Status = "draining"
+	if m.active == code {
+		m.active = ""
+	}
+	m.mu.Unlock()
+	go m.drainAndStop(instance)
+	return nil
+}
+
+func (m *Manager) drainAndStop(instance *Instance) {
+	deadline := time.Now().Add(time.Duration(m.cfg.DrainTimeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.RLock()
+		connections := instance.ActiveConnections
+		m.mu.RUnlock()
+		if connections == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	m.stopInstance(instance)
+}
+
+func (m *Manager) stopInstance(instance *Instance) {
+	m.mu.Lock()
+	cmd := instance.cmd
+	if cmd == nil || cmd.Process == nil {
+		instance.Status = "stopped"
+		instance.Error = ""
+		m.mu.Unlock()
+		return
+	}
 	instance.stopping = true
+	instance.draining = true
 	instance.Status = "stopping"
 	m.mu.Unlock()
-
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		_ = cmd.Process.Kill()
 	}
@@ -289,7 +334,25 @@ func (m *Manager) Stop(code string) error {
 			_ = cmd.Process.Kill()
 		}
 	}()
-	return nil
+}
+
+func (m *Manager) acquireInstance(code string) (*Instance, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	instance := m.instances[normalizeCode(code)]
+	if instance == nil || (instance.Status != "running" && instance.Status != "switching") || instance.draining {
+		return nil, false
+	}
+	instance.ActiveConnections++
+	return instance, true
+}
+
+func (m *Manager) releaseInstance(instance *Instance) {
+	m.mu.Lock()
+	if instance.ActiveConnections > 0 {
+		instance.ActiveConnections--
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Activate(code string) error {
@@ -309,7 +372,7 @@ func (m *Manager) UpdateMaxRunning(limit int) {
 	running := 0
 	candidates := make([]*Instance, 0)
 	for code, instance := range m.instances {
-		if instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" {
+		if instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" && instance.Status != "switching" {
 			continue
 		}
 		running++
@@ -354,6 +417,7 @@ func (m *Manager) ensureCountry(country Country) (*Instance, error) {
 	}
 	instance := &Instance{Country: country, SocksPort: port, Status: "stopped"}
 	m.instances[country.Code] = instance
+	m.allInstances[instance] = struct{}{}
 	m.cfg.Countries = append(m.cfg.Countries, country)
 	return instance, nil
 }
@@ -376,7 +440,7 @@ func (m *Manager) startNode(node ExitNode, activate bool) error {
 	}
 	m.mu.RLock()
 	alreadyRunning := instance.ExitFingerprint == strings.ToUpper(node.Fingerprint) && instance.Status == "running"
-	needsStop := instance.cmd != nil && !alreadyRunning
+	needsReplacement := instance.cmd != nil && !alreadyRunning
 	m.mu.RUnlock()
 	if alreadyRunning {
 		if activate {
@@ -386,26 +450,8 @@ func (m *Manager) startNode(node ExitNode, activate bool) error {
 		}
 		return nil
 	}
-	if needsStop {
-		if err := m.Stop(instance.Country.Code); err != nil {
-			return err
-		}
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			m.mu.RLock()
-			stopped := instance.cmd == nil
-			m.mu.RUnlock()
-			if stopped {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		m.mu.RLock()
-		stillRunning := instance.cmd != nil
-		m.mu.RUnlock()
-		if stillRunning {
-			return errors.New("previous country instance did not stop in time")
-		}
+	if needsReplacement {
+		return m.replaceNode(instance, node, activate)
 	}
 	m.mu.Lock()
 	instance.ExitFingerprint = strings.ToUpper(node.Fingerprint)
@@ -416,6 +462,142 @@ func (m *Manager) startNode(node ExitNode, activate bool) error {
 		return m.Activate(instance.Country.Code)
 	}
 	return m.Start(instance.Country.Code)
+}
+
+func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) error {
+	replacementPort, err := availableLocalPort()
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if current.replacement {
+		m.mu.Unlock()
+		return errors.New("a replacement instance is already starting for this country")
+	}
+	current.replacement = true
+	current.Status = "switching"
+	replacement := &Instance{
+		Country:         current.Country,
+		SocksPort:       replacementPort,
+		Status:          "stopped",
+		ExitFingerprint: strings.ToUpper(node.Fingerprint),
+		SelectedIP:      node.IP,
+		SelectedNode:    node.Nickname,
+	}
+	m.mu.Unlock()
+	if err := m.startDetached(replacement, fmt.Sprintf("replacement-%d", time.Now().UnixNano())); err != nil {
+		m.mu.Lock()
+		current.replacement = false
+		current.Status = "running"
+		current.Error = "replacement failed: " + err.Error()
+		m.mu.Unlock()
+		return err
+	}
+	go m.completeReplacement(current, replacement, activate)
+	return nil
+}
+
+func availableLocalPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("allocate replacement SOCKS port: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		return 0, fmt.Errorf("release replacement SOCKS port: %w", err)
+	}
+	return port, nil
+}
+
+func (m *Manager) startDetached(instance *Instance, suffix string) error {
+	code := instance.Country.Code
+	instanceDir := filepath.Join(m.cfg.StateDir, code+"-"+suffix)
+	dataDir := filepath.Join(instanceDir, "data")
+	logDir := filepath.Join(instanceDir, "logs")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return err
+	}
+	torrcPath := filepath.Join(instanceDir, "torrc")
+	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
+		return err
+	}
+	cmd := exec.Command(m.cfg.TorBinary, "-f", torrcPath)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start replacement tor: %w", err)
+	}
+	instance.cmd = cmd
+	instance.Status = "starting"
+	instance.StartedAt = time.Now()
+	m.mu.Lock()
+	m.allInstances[instance] = struct{}{}
+	m.mu.Unlock()
+	go m.watch(instance, cmd)
+	go m.awaitReady(instance, cmd)
+	return nil
+}
+
+func (m *Manager) completeReplacement(current, replacement *Instance, activate bool) {
+	deadline := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(deadline) {
+		m.mu.RLock()
+		status := replacement.Status
+		m.mu.RUnlock()
+		if status == "running" {
+			m.mu.Lock()
+			if m.instances[current.Country.Code] != current {
+				m.mu.Unlock()
+				m.stopInstance(replacement)
+				return
+			}
+			replacement.ActiveConnections = 0
+			m.instances[current.Country.Code] = replacement
+			if activate {
+				m.active = current.Country.Code
+			}
+			current.replacement = false
+			current.draining = true
+			current.Status = "draining"
+			replacement.DrainingConnections = current.ActiveConnections
+			m.mu.Unlock()
+			go m.drainInstance(current, replacement)
+			return
+		}
+		if status == "error" || status == "stopped" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	m.mu.Lock()
+	current.replacement = false
+	current.Status = "running"
+	current.Error = "replacement instance did not become ready; old route was preserved"
+	m.mu.Unlock()
+	m.stopInstance(replacement)
+}
+
+func (m *Manager) drainInstance(old, current *Instance) {
+	deadline := time.Now().Add(time.Duration(m.cfg.DrainTimeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		current.DrainingConnections = old.ActiveConnections
+		connections := old.ActiveConnections
+		m.mu.Unlock()
+		if connections == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	m.stopInstance(old)
+	m.mu.Lock()
+	if m.instances[current.Country.Code] == current {
+		current.DrainingConnections = 0
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Instance(code string) (Instance, bool) {
@@ -454,25 +636,20 @@ func (m *Manager) State() State {
 
 func (m *Manager) Shutdown() {
 	m.mu.RLock()
-	codes := make([]string, 0, len(m.instances))
-	for code, instance := range m.instances {
+	instances := make([]*Instance, 0, len(m.allInstances))
+	for instance := range m.allInstances {
 		if instance.cmd != nil {
-			codes = append(codes, code)
+			instances = append(instances, instance)
 		}
 	}
 	m.mu.RUnlock()
-	for _, code := range codes {
-		_ = m.Stop(code)
+	for _, instance := range instances {
+		m.stopInstance(instance)
 	}
 }
 
-func (m *Manager) refreshExitIP(code string) bool {
+func (m *Manager) refreshInstanceExitIP(instance *Instance) bool {
 	m.mu.RLock()
-	instance, ok := m.instances[normalizeCode(code)]
-	if !ok {
-		m.mu.RUnlock()
-		return false
-	}
 	port := instance.SocksPort
 	m.mu.RUnlock()
 
@@ -499,17 +676,15 @@ func (m *Manager) refreshExitIP(code string) bool {
 		return false
 	}
 	m.mu.Lock()
-	if current := m.instances[normalizeCode(code)]; current != nil {
-		current.ExitIP = result.IP
-		current.Status = "running"
-		current.Error = ""
-	}
+	instance.ExitIP = result.IP
+	instance.Status = "running"
+	instance.Error = ""
 	m.mu.Unlock()
-	m.lookupExitInfo(client, code, result.IP)
+	m.lookupExitInfo(client, instance, result.IP)
 	return true
 }
 
-func (m *Manager) lookupExitInfo(client *http.Client, code, ip string) {
+func (m *Manager) lookupExitInfo(client *http.Client, instance *Instance, ip string) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return
@@ -532,12 +707,12 @@ func (m *Manager) lookupExitInfo(client *http.Client, code, ip string) {
 		return
 	}
 	m.mu.Lock()
-	if current := m.instances[normalizeCode(code)]; current != nil && current.ExitIP == ip {
-		current.ExitISP = info.Org
-		current.ExitASN = info.ASN
-		current.ExitCountry = info.CountryName
-		current.ExitCountryCode = info.CountryCode
-		current.ExitCity = info.City
+	if instance.ExitIP == ip {
+		instance.ExitISP = info.Org
+		instance.ExitASN = info.ASN
+		instance.ExitCountry = info.CountryName
+		instance.ExitCountryCode = info.CountryCode
+		instance.ExitCity = info.City
 	}
 	m.mu.Unlock()
 }

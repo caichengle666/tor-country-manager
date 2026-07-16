@@ -10,10 +10,12 @@ import (
 func TestBearerTokenAuthentication(t *testing.T) {
 	request := httptest.NewRequest("GET", "/api/v1/countries", nil)
 	request.Header.Set("Authorization", "Bearer secret-value")
-	if !validBearerToken(request, "secret-value") {
+	auth := NewRuntimeClientAuth("secret-value")
+	if !validBearerToken(request, auth) {
 		t.Fatal("valid Bearer token was rejected")
 	}
-	if validBearerToken(request, "different-value") {
+	auth.Update("different-value")
+	if validBearerToken(request, auth) {
 		t.Fatal("invalid Bearer token was accepted")
 	}
 }

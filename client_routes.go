@@ -58,7 +58,7 @@ func (m *Manager) EnsureCountryProxy(code string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if m.cfg.ClientAPIKey == "" {
+	if m.clientAuth.Key() == "" {
 		return 0, errors.New("client API key is not configured")
 	}
 	m.countryListenMu.Lock()
@@ -103,18 +103,16 @@ func (m *Manager) serveCountryProxy(ctx context.Context, code string, listener n
 func (m *Manager) forwardCountry(client net.Conn, code string) {
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
-	if !negotiateClientAuth(client, code, m.cfg.ClientAPIKey) {
+	if !negotiateClientAuth(client, code, m.clientAuth.Key()) {
 		return
 	}
-	m.mu.RLock()
-	instance := m.instances[code]
-	if instance == nil || instance.Status != "running" {
-		m.mu.RUnlock()
+	instance, ok := m.acquireInstance(code)
+	if !ok {
 		_, _ = client.Write([]byte{1, 1})
 		return
 	}
+	defer m.releaseInstance(instance)
 	internalAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(instance.SocksPort))
-	m.mu.RUnlock()
 	upstream, err := net.DialTimeout("tcp", internalAddress, 5*time.Second)
 	if err != nil {
 		_, _ = client.Write([]byte{1, 1})
@@ -136,6 +134,10 @@ func (m *Manager) forwardCountry(client net.Conn, code string) {
 	_ = client.SetDeadline(time.Time{})
 	_ = upstream.SetDeadline(time.Time{})
 	proxyBothWays(client, upstream)
+}
+
+func (m *Manager) UpdateClientAPIKey(key string) {
+	m.clientAuth.Update(key)
 }
 
 func negotiateClientAuth(connection net.Conn, expectedUsername, expectedPassword string) bool {
@@ -190,15 +192,15 @@ func constantTimeEqual(value, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(value), []byte(expected)) == 1
 }
 
-func validBearerToken(request *http.Request, expected string) bool {
-	if expected == "" {
+func validBearerToken(request *http.Request, auth *RuntimeClientAuth) bool {
+	if auth == nil {
 		return false
 	}
 	value := request.Header.Get("Authorization")
 	if !strings.HasPrefix(value, "Bearer ") {
 		return false
 	}
-	return constantTimeEqual(strings.TrimSpace(strings.TrimPrefix(value, "Bearer ")), expected)
+	return auth.Valid(strings.TrimSpace(strings.TrimPrefix(value, "Bearer ")))
 }
 
 func clientRouteForRequest(manager *Manager, cfg Config, request *http.Request, code string) (ClientRoute, error) {
@@ -218,7 +220,7 @@ func clientRouteForRequest(manager *Manager, cfg Config, request *http.Request, 
 		Username:       code,
 		Authentication: "password_is_client_api_key",
 		Status:         instance.Status,
-		Ready:          instance.Status == "running",
+		Ready:          instance.Status == "running" || instance.Status == "switching",
 		ExitIP:         instance.ExitIP,
 		SelectedIP:     instance.SelectedIP,
 		SelectedNode:   instance.SelectedNode,

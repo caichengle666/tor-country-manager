@@ -33,13 +33,13 @@ func (m *Manager) forward(client net.Conn) {
 	defer client.Close()
 	m.mu.RLock()
 	active := m.active
-	instance := m.instances[active]
-	if instance == nil || instance.Status != "running" {
-		m.mu.RUnlock()
+	m.mu.RUnlock()
+	instance, ok := m.acquireInstance(active)
+	if !ok {
 		return
 	}
+	defer m.releaseInstance(instance)
 	port := instance.SocksPort
-	m.mu.RUnlock()
 	upstream, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return

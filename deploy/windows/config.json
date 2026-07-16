@@ -9,6 +9,7 @@
   "country_proxy_host": "127.0.0.1",
   "country_proxy_base_port": 20000,
   "max_running": 10,
+  "drain_timeout_seconds": 120,
   "auth_token": "",
   "client_api_key": "",
   "upstream_socks5": "",

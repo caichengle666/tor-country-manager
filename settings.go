@@ -86,6 +86,12 @@ func (s *ConfigStore) Client(effectiveHasAPIKey bool) ClientSettings {
 	return ClientSettings{Host: s.cfg.CountryProxyHost, BasePort: s.cfg.CountryProxyPort, HasAPIKey: effectiveHasAPIKey || s.cfg.ClientAPIKey != ""}
 }
 
+func (s *ConfigStore) ClientAPIKey() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.ClientAPIKey
+}
+
 func (s *ConfigStore) UpdateClient(update ClientUpdate) (string, error) {
 	update.Host = strings.TrimSpace(update.Host)
 	providedKey := update.APIKey != nil && strings.TrimSpace(*update.APIKey) != ""
