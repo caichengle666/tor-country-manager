@@ -108,24 +108,24 @@ func (m *Manager) forwardCountry(client net.Conn, code string) {
 	}
 	instance, ok := m.acquireInstance(code)
 	if !ok {
-		_, _ = client.Write([]byte{1, 1})
+		writeSOCKS5Failure(client, 1)
 		return
 	}
 	defer m.releaseInstance(instance)
 	internalAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(instance.SocksPort))
 	upstream, err := net.DialTimeout("tcp", internalAddress, 5*time.Second)
 	if err != nil {
-		_, _ = client.Write([]byte{1, 1})
+		writeSOCKS5Failure(client, 1)
 		return
 	}
 	defer upstream.Close()
 	if _, err := upstream.Write([]byte{5, 1, 0}); err != nil {
-		_, _ = client.Write([]byte{1, 1})
+		writeSOCKS5Failure(client, 1)
 		return
 	}
 	response := make([]byte, 2)
 	if _, err := io.ReadFull(upstream, response); err != nil || response[0] != 5 || response[1] != 0 {
-		_, _ = client.Write([]byte{1, 1})
+		writeSOCKS5Failure(client, 1)
 		return
 	}
 	if _, err := client.Write([]byte{1, 0}); err != nil {
@@ -134,6 +134,10 @@ func (m *Manager) forwardCountry(client net.Conn, code string) {
 	_ = client.SetDeadline(time.Time{})
 	_ = upstream.SetDeadline(time.Time{})
 	proxyBothWays(client, upstream)
+}
+
+func writeSOCKS5Failure(connection net.Conn, status byte) {
+	_, _ = connection.Write([]byte{5, status, 0, 1, 0, 0, 0, 0, 0, 0})
 }
 
 func (m *Manager) UpdateClientAPIKey(key string) {

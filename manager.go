@@ -84,7 +84,7 @@ func (m *Manager) Start(code string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("unknown country %q", code)
 	}
-	if instance.Status == "starting" || instance.Status == "connecting" || instance.Status == "running" {
+	if instance.Status == "starting" || instance.Status == "connecting" || instance.Status == "running" || instance.Status == "switching" || instance.Status == "draining" {
 		m.mu.Unlock()
 		return nil
 	}
