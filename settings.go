@@ -66,26 +66,12 @@ func (s *ConfigStore) Runtime() RuntimeSettings {
 	return RuntimeSettings{MaxRunning: s.cfg.MaxRunning, CircuitRotateMinutes: s.cfg.CircuitRotateMinutes}
 }
 
-func (s *ConfigStore) UpdateMaxRunning(limit int) error {
+func (s *ConfigStore) UpdateRuntime(settings RuntimeSettings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := s.cfg
-	next.MaxRunning = limit
-	if err := next.validate(); err != nil {
-		return err
-	}
-	if err := s.saveLocked(next); err != nil {
-		return err
-	}
-	s.cfg = next
-	return nil
-}
-
-func (s *ConfigStore) UpdateCircuitRotateMinutes(minutes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := s.cfg
-	next.CircuitRotateMinutes = minutes
+	next.MaxRunning = settings.MaxRunning
+	next.CircuitRotateMinutes = settings.CircuitRotateMinutes
 	if err := next.validate(); err != nil {
 		return err
 	}

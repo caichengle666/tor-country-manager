@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -229,14 +228,6 @@ func clientRouteForRequest(manager *Manager, cfg Config, request *http.Request, 
 		SelectedIP:     instance.SelectedIP,
 		SelectedNode:   instance.SelectedNode,
 	}, nil
-}
-
-func proxyBothWays(first, second net.Conn) {
-	var wait sync.WaitGroup
-	wait.Add(2)
-	go func() { defer wait.Done(); _, _ = io.Copy(second, first) }()
-	go func() { defer wait.Done(); _, _ = io.Copy(first, second) }()
-	wait.Wait()
 }
 
 func publicRouteHost(requestHost, configuredHost string) string {

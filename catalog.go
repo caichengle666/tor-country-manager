@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +51,13 @@ type ExitCatalog struct {
 	latencySem chan struct{}
 }
 
+type CatalogStatus struct {
+	LastUpdated time.Time `json:"last_updated,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+	NodeCount   int       `json:"node_count"`
+	Stale       bool      `json:"stale"`
+}
+
 func NewExitCatalog(cfg Config) *ExitCatalog {
 	return &ExitCatalog{
 		cfg:        cfg,
@@ -82,8 +88,20 @@ func (c *ExitCatalog) UpdateUpstream(cfg Config) {
 }
 
 func (c *ExitCatalog) EnsureFresh(ctx context.Context) error {
+	err := c.refresh(ctx, false)
+	if err != nil && c.Status().NodeCount > 0 {
+		return nil
+	}
+	return err
+}
+
+func (c *ExitCatalog) Refresh(ctx context.Context) error {
+	return c.refresh(ctx, true)
+}
+
+func (c *ExitCatalog) refresh(ctx context.Context, force bool) error {
 	c.mu.RLock()
-	fresh := len(c.nodes) > 0 && time.Since(c.fetchedAt) < 10*time.Minute
+	fresh := !force && len(c.nodes) > 0 && time.Since(c.fetchedAt) < 10*time.Minute
 	c.mu.RUnlock()
 	if fresh {
 		return nil
@@ -91,7 +109,7 @@ func (c *ExitCatalog) EnsureFresh(ctx context.Context) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 	c.mu.RLock()
-	fresh = len(c.nodes) > 0 && time.Since(c.fetchedAt) < 10*time.Minute
+	fresh = !force && len(c.nodes) > 0 && time.Since(c.fetchedAt) < 10*time.Minute
 	c.mu.RUnlock()
 	if fresh {
 		return nil
@@ -169,6 +187,17 @@ func (c *ExitCatalog) EnsureFresh(ctx context.Context) error {
 	c.lastError = ""
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *ExitCatalog) Status() CatalogStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return CatalogStatus{
+		LastUpdated: c.fetchedAt,
+		LastError:   c.lastError,
+		NodeCount:   len(c.nodes),
+		Stale:       c.fetchedAt.IsZero() || time.Since(c.fetchedAt) >= 10*time.Minute || c.lastError != "",
+	}
 }
 
 func allowsPort(accept, reject []string, port int) bool {
@@ -273,16 +302,7 @@ func (c *ExitCatalog) NodesForCountry(code string) []ExitNode {
 		}
 	}
 	c.mu.RUnlock()
-	sort.Slice(nodes, func(i, j int) bool {
-		left, right := latencyRank(nodes[i].LatencyMS), latencyRank(nodes[j].LatencyMS)
-		if left != right {
-			return left < right
-		}
-		if nodes[i].LatencyMS >= 0 && nodes[i].LatencyMS != nodes[j].LatencyMS {
-			return nodes[i].LatencyMS < nodes[j].LatencyMS
-		}
-		return nodes[i].ConsensusWeight > nodes[j].ConsensusWeight
-	})
+	sort.Slice(nodes, func(i, j int) bool { return lessExitNode(nodes[i], nodes[j]) })
 	return nodes
 }
 
@@ -294,6 +314,17 @@ func latencyRank(latency int) int {
 		return 1
 	}
 	return 2
+}
+
+func lessExitNode(left, right ExitNode) bool {
+	leftRank, rightRank := latencyRank(left.LatencyMS), latencyRank(right.LatencyMS)
+	if leftRank != rightRank {
+		return leftRank < rightRank
+	}
+	if left.LatencyMS >= 0 && left.LatencyMS != right.LatencyMS {
+		return left.LatencyMS < right.LatencyMS
+	}
+	return left.ConsensusWeight > right.ConsensusWeight
 }
 
 func (c *ExitCatalog) Node(fingerprint string) (ExitNode, bool) {
@@ -370,16 +401,7 @@ func (c *ExitCatalog) bestCandidate(countries []string, policy string, requireMe
 	if len(candidates) == 0 {
 		return ExitNode{}, false
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		left, right := latencyRank(candidates[i].LatencyMS), latencyRank(candidates[j].LatencyMS)
-		if left != right {
-			return left < right
-		}
-		if candidates[i].LatencyMS >= 0 && candidates[i].LatencyMS != candidates[j].LatencyMS {
-			return candidates[i].LatencyMS < candidates[j].LatencyMS
-		}
-		return candidates[i].ConsensusWeight > candidates[j].ConsensusWeight
-	})
+	sort.Slice(candidates, func(i, j int) bool { return lessExitNode(candidates[i], candidates[j]) })
 	return candidates[0], true
 }
 
@@ -440,88 +462,6 @@ func (c *ExitCatalog) measureTCPLatency(address string) int {
 		return 1
 	}
 	return int(elapsed)
-}
-
-func dialViaUpstreamSOCKS5(ctx context.Context, proxyAddress, targetAddress, username, password string) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: 12 * time.Second}
-	connection, err := dialer.DialContext(ctx, "tcp", proxyAddress)
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (net.Conn, error) { _ = connection.Close(); return nil, err }
-	methods := []byte{0}
-	if username != "" || password != "" {
-		methods = []byte{0, 2}
-	}
-	greeting := append([]byte{5, byte(len(methods))}, methods...)
-	if _, err := connection.Write(greeting); err != nil {
-		return fail(err)
-	}
-	response := make([]byte, 2)
-	if _, err := io.ReadFull(connection, response); err != nil || response[0] != 5 || response[1] == 0xff {
-		if err == nil {
-			err = errors.New("upstream SOCKS5 authentication negotiation failed")
-		}
-		return fail(err)
-	}
-	if response[1] == 2 {
-		if len(username) > 255 || len(password) > 255 {
-			return fail(errors.New("upstream SOCKS5 credentials are too long"))
-		}
-		auth := []byte{1, byte(len(username))}
-		auth = append(auth, username...)
-		auth = append(auth, byte(len(password)))
-		auth = append(auth, password...)
-		if _, err := connection.Write(auth); err != nil {
-			return fail(err)
-		}
-		if _, err := io.ReadFull(connection, response); err != nil || response[1] != 0 {
-			if err == nil {
-				err = errors.New("upstream SOCKS5 credentials were rejected")
-			}
-			return fail(err)
-		}
-	}
-	host, portText, err := net.SplitHostPort(targetAddress)
-	if err != nil {
-		return fail(err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 || len(host) > 255 {
-		return fail(errors.New("invalid SOCKS5 target"))
-	}
-	request := []byte{5, 1, 0, 3, byte(len(host))}
-	request = append(request, host...)
-	request = binary.BigEndian.AppendUint16(request, uint16(port))
-	if _, err := connection.Write(request); err != nil {
-		return fail(err)
-	}
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(connection, header); err != nil || header[1] != 0 {
-		if err == nil {
-			err = fmt.Errorf("upstream SOCKS5 returned status %d", header[1])
-		}
-		return fail(err)
-	}
-	addressLength := 0
-	switch header[3] {
-	case 1:
-		addressLength = 4
-	case 3:
-		length := make([]byte, 1)
-		if _, err := io.ReadFull(connection, length); err != nil {
-			return fail(err)
-		}
-		addressLength = int(length[0])
-	case 4:
-		addressLength = 16
-	default:
-		return fail(errors.New("upstream SOCKS5 returned an unknown address type"))
-	}
-	if _, err := io.CopyN(io.Discard, connection, int64(addressLength+2)); err != nil {
-		return fail(err)
-	}
-	return connection, nil
 }
 
 var continentByCode = buildContinentMap()

@@ -162,7 +162,9 @@ func TestRuntimeUpdateDoesNotPersistEnvironmentProxy(t *testing.T) {
 		t.Fatal("environment proxy was not applied to effective config")
 	}
 	store := NewConfigStore(path, loaded.Stored)
-	if err := store.UpdateMaxRunning(7); err != nil {
+	runtimeSettings := store.Runtime()
+	runtimeSettings.MaxRunning = 7
+	if err := store.UpdateRuntime(runtimeSettings); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -245,7 +247,9 @@ func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	}
 
 	store := NewConfigStore(path, loaded.Stored)
-	if err := store.UpdateMaxRunning(7); err != nil {
+	runtimeSettings := store.Runtime()
+	runtimeSettings.MaxRunning = 7
+	if err := store.UpdateRuntime(runtimeSettings); err != nil {
 		t.Fatal(err)
 	}
 	saved, err := os.ReadFile(path)
@@ -254,5 +258,18 @@ func TestLoadedConfigKeepsStoredAndEffectiveSnapshotsSeparate(t *testing.T) {
 	}
 	if strings.Contains(string(saved), "environment-secret") || strings.Contains(string(saved), "environment-api-key") || !strings.Contains(string(saved), "stored-secret") {
 		t.Fatal("saved config did not preserve the stored snapshot")
+	}
+}
+
+func TestRuntimeUpdateIsAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	store := NewConfigStore(path, defaultConfig())
+	before := store.Runtime()
+	err := store.UpdateRuntime(RuntimeSettings{MaxRunning: 7, CircuitRotateMinutes: 1441})
+	if err == nil {
+		t.Fatal("invalid runtime settings should be rejected")
+	}
+	if after := store.Runtime(); after != before {
+		t.Fatalf("runtime settings changed after failed update: before=%+v after=%+v", before, after)
 	}
 }

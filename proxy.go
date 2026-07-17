@@ -45,9 +45,13 @@ func (m *Manager) forward(client net.Conn) {
 		return
 	}
 	defer upstream.Close()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = io.Copy(upstream, client) }()
-	go func() { defer wg.Done(); _, _ = io.Copy(client, upstream) }()
-	wg.Wait()
+	proxyBothWays(client, upstream)
+}
+
+func proxyBothWays(first, second net.Conn) {
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() { defer wait.Done(); _, _ = io.Copy(second, first) }()
+	go func() { defer wait.Done(); _, _ = io.Copy(first, second) }()
+	wait.Wait()
 }

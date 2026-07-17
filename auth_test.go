@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+func authStoreVerifies(store *AuthStore, password string) bool {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	return store.verifyLocked(password)
+}
+
 func TestAuthNotConfiguredByDefault(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.StateDir = t.TempDir()
@@ -33,10 +39,10 @@ func TestAuthLegacyToken(t *testing.T) {
 	if !store.Configured() {
 		t.Fatal("store should be configured with a legacy token")
 	}
-	if !store.Verify("legacy-secret") {
+	if !authStoreVerifies(store, "legacy-secret") {
 		t.Fatal("legacy token should verify")
 	}
-	if store.Verify("wrong-token") {
+	if authStoreVerifies(store, "wrong-token") {
 		t.Fatal("wrong token should not verify")
 	}
 }
@@ -54,13 +60,13 @@ func TestAuthSetupAndVerify(t *testing.T) {
 	if !store.Configured() {
 		t.Fatal("store should be configured after setup")
 	}
-	if !store.Verify("test-password-123") {
+	if !authStoreVerifies(store, "test-password-123") {
 		t.Fatal("correct password should verify")
 	}
-	if store.Verify("wrong-password") {
+	if authStoreVerifies(store, "wrong-password") {
 		t.Fatal("wrong password should not verify")
 	}
-	if store.Verify("") {
+	if authStoreVerifies(store, "") {
 		t.Fatal("empty password should not verify")
 	}
 }
@@ -108,10 +114,10 @@ func TestAuthChangePassword(t *testing.T) {
 	if err := store.Change("original-password", "new-password-here"); err != nil {
 		t.Fatalf("change with correct current password failed: %v", err)
 	}
-	if !store.Verify("new-password-here") {
+	if !authStoreVerifies(store, "new-password-here") {
 		t.Fatal("new password should verify")
 	}
-	if store.Verify("original-password") {
+	if authStoreVerifies(store, "original-password") {
 		t.Fatal("old password should not verify after change")
 	}
 }
@@ -177,10 +183,10 @@ func TestAuthPersistsAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !store2.Verify("persisted-password") {
+	if !authStoreVerifies(store2, "persisted-password") {
 		t.Fatal("password should persist across restart")
 	}
-	if store2.Verify("other-password") {
+	if authStoreVerifies(store2, "other-password") {
 		t.Fatal("wrong password should not verify after restart")
 	}
 }
@@ -203,7 +209,7 @@ func TestAuthRejectsMangledHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if store2.Verify("real-password") {
+	if authStoreVerifies(store2, "real-password") {
 		t.Fatal("mangled hash should not verify")
 	}
 }

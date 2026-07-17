@@ -516,3 +516,26 @@ func TestReplaceNodeOverridesPendingReplacement(t *testing.T) {
 		t.Fatalf("current instance was not preserved after replacement start failure: %#v", current)
 	}
 }
+
+func TestAutoRestartEligibility(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	instance := manager.instances["us"]
+	instance.Status = "error"
+	if !manager.autoRestartEligibleLocked(instance) {
+		t.Fatal("current failed instance should be eligible for automatic restart")
+	}
+	instance.restartAttempts = autoRestartLimit
+	if manager.autoRestartEligibleLocked(instance) {
+		t.Fatal("instance exceeding restart limit should not be eligible")
+	}
+	instance.restartAttempts = 0
+	instance.pendingReplacement = &Instance{}
+	if manager.autoRestartEligibleLocked(instance) {
+		t.Fatal("instance with a pending replacement should not be eligible")
+	}
+	instance.pendingReplacement = nil
+	manager.shuttingDown = true
+	if manager.autoRestartEligibleLocked(instance) {
+		t.Fatal("instance should not restart during manager shutdown")
+	}
+}

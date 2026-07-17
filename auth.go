@@ -108,12 +108,6 @@ func (a *AuthStore) setPasswordLocked(password string) error {
 	return nil
 }
 
-func (a *AuthStore) Verify(password string) bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.verifyLocked(password)
-}
-
 func (a *AuthStore) Authenticate(client, password string) (bool, time.Duration) {
 	return a.authenticateAt(client, password, time.Now())
 }

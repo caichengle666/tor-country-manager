@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +51,8 @@ type Instance struct {
 	replacementPreviousStatus string
 	replacementPreviousError  string
 	pendingReplacement        *Instance
+	restartAttempts           int
+	restartScheduled          bool
 }
 
 type Manager struct {
@@ -66,7 +67,10 @@ type Manager struct {
 	countryListeners map[string]net.Listener
 	countryListenMu  sync.Mutex
 	clientAuth       *RuntimeClientAuth
+	shuttingDown     bool
 }
+
+const autoRestartLimit = 3
 
 type PersistedNode struct {
 	Country         Country   `json:"country"`
@@ -236,26 +240,11 @@ func (m *Manager) Start(code string) error {
 		m.mu.Unlock()
 		return nil
 	}
-	instanceDir := filepath.Join(m.cfg.StateDir, code)
-	dataDir := filepath.Join(instanceDir, "data")
-	logDir := filepath.Join(instanceDir, "logs")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	cmd, err := m.prepareTorCommand(instance, filepath.Join(m.cfg.StateDir, code))
+	if err != nil {
 		m.mu.Unlock()
 		return err
 	}
-	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	instance.dataDir = dataDir
-	torrcPath := filepath.Join(instanceDir, "torrc")
-	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	cmd := exec.Command(m.cfg.TorBinary, "-f", torrcPath)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		instance.Status = "error"
 		instance.Error = err.Error()
@@ -266,6 +255,7 @@ func (m *Manager) Start(code string) error {
 	m.allInstances[instance] = struct{}{}
 	instance.Status = "starting"
 	instance.BootstrapProgress = 0
+	instance.restartScheduled = false
 	instance.Error = ""
 	instance.ExitIP = ""
 	instance.ExitISP = ""
@@ -345,11 +335,31 @@ func (m *Manager) torrc(instance *Instance, dataDir, logDir string) string {
 	return b.String()
 }
 
+func (m *Manager) prepareTorCommand(instance *Instance, instanceDir string) (*exec.Cmd, error) {
+	dataDir := filepath.Join(instanceDir, "data")
+	logDir := filepath.Join(instanceDir, "logs")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return nil, err
+	}
+	instance.dataDir = dataDir
+	torrcPath := filepath.Join(instanceDir, "torrc")
+	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(m.cfg.TorBinary, "-f", torrcPath)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd, nil
+}
+
 func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 	err := cmd.Wait()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if instance.cmd != cmd {
+		m.mu.Unlock()
 		return
 	}
 	instance.cmd = nil
@@ -366,8 +376,62 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 		}
 	}
 	instance.stopping = false
+	if !instance.draining && m.scheduleAutoRestartLocked(instance, instance.Error) {
+		m.mu.Unlock()
+		return
+	}
+	if !m.shuttingDown && m.instances[instance.Country.Code] == instance && instance.restartAttempts >= autoRestartLimit {
+		instance.Error += "; automatic restart limit reached"
+	}
 	if current := m.instances[instance.Country.Code]; current == instance && m.active == instance.Country.Code {
 		m.active = ""
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) autoRestartEligibleLocked(instance *Instance) bool {
+	return !m.shuttingDown &&
+		m.instances[instance.Country.Code] == instance &&
+		instance.Status == "error" && instance.cmd == nil &&
+		!instance.stopping && !instance.draining &&
+		!instance.replacement && instance.pendingReplacement == nil &&
+		instance.restartAttempts < autoRestartLimit
+}
+
+func (m *Manager) scheduleAutoRestartLocked(instance *Instance, reason string) bool {
+	if !m.autoRestartEligibleLocked(instance) || instance.restartScheduled {
+		return false
+	}
+	instance.restartAttempts++
+	attempt := instance.restartAttempts
+	delay := time.Second << (attempt - 1)
+	instance.restartScheduled = true
+	instance.Error = fmt.Sprintf("%s; automatic restart %d/%d in %s", reason, attempt, autoRestartLimit, delay)
+	go m.runAutoRestart(instance, attempt, delay)
+	return true
+}
+
+func (m *Manager) runAutoRestart(instance *Instance, attempt int, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
+	m.mu.Lock()
+	if !instance.restartScheduled || instance.restartAttempts != attempt || !m.autoRestartEligibleLocked(instance) {
+		m.mu.Unlock()
+		return
+	}
+	instance.restartScheduled = false
+	m.mu.Unlock()
+	if err := m.Start(instance.Country.Code); err != nil {
+		m.mu.Lock()
+		reason := "automatic restart failed: " + err.Error()
+		if !m.scheduleAutoRestartLocked(instance, reason) {
+			instance.Error = fmt.Sprintf("%s; automatic restart limit reached after %d attempts", reason, instance.restartAttempts)
+			if m.active == instance.Country.Code {
+				m.active = ""
+			}
+		}
+		m.mu.Unlock()
 	}
 }
 
@@ -449,6 +513,8 @@ func (m *Manager) Stop(code string) error {
 	if instance.cmd == nil || instance.cmd.Process == nil {
 		instance.Status = "stopped"
 		instance.Error = ""
+		instance.restartScheduled = false
+		instance.restartAttempts = 0
 		m.mu.Unlock()
 		if replacement != nil {
 			m.stopInstance(replacement)
@@ -464,6 +530,8 @@ func (m *Manager) Stop(code string) error {
 		return nil
 	}
 	instance.draining = true
+	instance.restartScheduled = false
+	instance.restartAttempts = 0
 	instance.Status = "draining"
 	if m.active == code {
 		m.active = ""
@@ -788,23 +856,10 @@ func availableLocalPort() (int, error) {
 
 func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	code := instance.Country.Code
-	instanceDir := filepath.Join(m.cfg.StateDir, code+"-"+suffix)
-	dataDir := filepath.Join(instanceDir, "data")
-	logDir := filepath.Join(instanceDir, "logs")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	cmd, err := m.prepareTorCommand(instance, filepath.Join(m.cfg.StateDir, code+"-"+suffix))
+	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		return err
-	}
-	instance.dataDir = dataDir
-	torrcPath := filepath.Join(instanceDir, "torrc")
-	if err := os.WriteFile(torrcPath, []byte(m.torrc(instance, dataDir, logDir)), 0o600); err != nil {
-		return err
-	}
-	cmd := exec.Command(m.cfg.TorBinary, "-f", torrcPath)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start replacement tor: %w", err)
 	}
@@ -1148,14 +1203,15 @@ func (m *Manager) State() State {
 }
 
 func (m *Manager) Shutdown() {
-	m.mu.RLock()
+	m.mu.Lock()
+	m.shuttingDown = true
 	instances := make([]*Instance, 0, len(m.allInstances))
 	for instance := range m.allInstances {
 		if instance.cmd != nil {
 			instances = append(instances, instance)
 		}
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	for _, instance := range instances {
 		m.stopInstance(instance)
 	}
@@ -1206,6 +1262,8 @@ func (m *Manager) markInstanceRunning(instance *Instance, cmd *exec.Cmd, exitIP 
 	instance.Status = "running"
 	instance.BootstrapProgress = 100
 	instance.Error = ""
+	instance.restartAttempts = 0
+	instance.restartScheduled = false
 	return true
 }
 
@@ -1299,68 +1357,6 @@ func queryIPWho(client *http.Client, ip string) (exitInfo, bool) {
 		asn = fmt.Sprintf("AS%d", result.Connection.ASN)
 	}
 	return exitInfo{ASN: asn, Org: org, CountryName: result.Country, CountryCode: result.CountryCode, City: result.City}, org != "" || asn != ""
-}
-
-func dialViaSOCKS5(ctx context.Context, proxyAddress, targetAddress string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", proxyAddress)
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (net.Conn, error) { _ = conn.Close(); return nil, err }
-	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
-		return fail(err)
-	}
-	response := make([]byte, 2)
-	if _, err := io.ReadFull(conn, response); err != nil || response[0] != 5 || response[1] != 0 {
-		if err == nil {
-			err = errors.New("SOCKS5 authentication negotiation failed")
-		}
-		return fail(err)
-	}
-	host, portText, err := net.SplitHostPort(targetAddress)
-	if err != nil {
-		return fail(err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return fail(errors.New("invalid target port"))
-	}
-	if len(host) > 255 {
-		return fail(errors.New("target hostname is too long"))
-	}
-	request := []byte{5, 1, 0, 3, byte(len(host))}
-	request = append(request, host...)
-	request = binary.BigEndian.AppendUint16(request, uint16(port))
-	if _, err := conn.Write(request); err != nil {
-		return fail(err)
-	}
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return fail(err)
-	}
-	if header[1] != 0 {
-		return fail(fmt.Errorf("SOCKS5 proxy returned status %d", header[1]))
-	}
-	var addressLength int
-	switch header[3] {
-	case 1:
-		addressLength = 4
-	case 3:
-		length := make([]byte, 1)
-		if _, err := io.ReadFull(conn, length); err != nil {
-			return fail(err)
-		}
-		addressLength = int(length[0])
-	case 4:
-		addressLength = 16
-	default:
-		return fail(errors.New("SOCKS5 proxy returned an unknown address type"))
-	}
-	if _, err := io.CopyN(io.Discard, conn, int64(addressLength+2)); err != nil {
-		return fail(err)
-	}
-	return conn, nil
 }
 
 func tailFile(path string, lines int) (string, error) {

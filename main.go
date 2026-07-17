@@ -189,15 +189,11 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			writeError(w, err)
 			return
 		}
-		if err := configStore.UpdateMaxRunning(input.MaxRunning); err != nil {
+		if err := configStore.UpdateRuntime(input); err != nil {
 			writeError(w, err)
 			return
 		}
 		manager.UpdateMaxRunning(input.MaxRunning)
-		if err := configStore.UpdateCircuitRotateMinutes(input.CircuitRotateMinutes); err != nil {
-			writeError(w, err)
-			return
-		}
 		manager.UpdateCircuitRotateMinutes(input.CircuitRotateMinutes)
 		writeJSON(w, http.StatusOK, map[string]any{"settings": configStore.Runtime(), "applied": true})
 	})
@@ -296,7 +292,16 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"countries": catalog.Countries()})
+		writeJSON(w, http.StatusOK, map[string]any{"countries": catalog.Countries(), "status": catalog.Status()})
+	})
+	mux.HandleFunc("POST /api/exits/refresh", func(w http.ResponseWriter, r *http.Request) {
+		err := catalog.Refresh(r.Context())
+		status := catalog.Status()
+		if err != nil && status.NodeCount == 0 {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"countries": catalog.Countries(), "status": status})
 	})
 	mux.HandleFunc("GET /api/exits/countries/{code}", func(w http.ResponseWriter, r *http.Request) {
 		code := normalizeCode(r.PathValue("code"))
