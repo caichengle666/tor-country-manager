@@ -81,6 +81,7 @@ jobs:
             exe: ""
             tor_install: "sudo apt-get update && sudo apt-get install -y --no-install-recommends tor tor-geoipdb"
             tor_bin: "/usr/bin/tor"
+            tor_dir: ""
             geoip: "/usr/share/tor/geoip"
             geoip6: "/usr/share/tor/geoip6"
             pkg: tar.gz
@@ -91,6 +92,7 @@ jobs:
             exe: ""
             tor_install: "sudo apt-get update && sudo apt-get install -y --no-install-recommends tor tor-geoipdb"
             tor_bin: "/usr/bin/tor"
+            tor_dir: ""
             geoip: "/usr/share/tor/geoip"
             geoip6: "/usr/share/tor/geoip6"
             pkg: tar.gz
@@ -101,6 +103,7 @@ jobs:
             exe: ".exe"
             tor_install: "curl -L -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz && mkdir -p C:/tor-expert && tar -xzf tor.tar.gz -C C:/tor-expert --strip-components=1"
             tor_bin: "C:/tor-expert/tor.exe"
+            tor_dir: "C:/tor-expert"
             geoip: "C:/tor-expert/geoip"
             geoip6: "C:/tor-expert/geoip6"
             pkg: zip
@@ -111,6 +114,7 @@ jobs:
             exe: ""
             tor_install: "curl -L -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-macos-x86_64-15.0.18.tar.gz && mkdir -p /tmp/tor-expert && tar -xzf tor.tar.gz -C /tmp/tor-expert --strip-components=1"
             tor_bin: "/tmp/tor-expert/tor"
+            tor_dir: "/tmp/tor-expert"
             geoip: "/tmp/tor-expert/geoip"
             geoip6: "/tmp/tor-expert/geoip6"
             pkg: tar.gz
@@ -121,6 +125,7 @@ jobs:
             exe: ""
             tor_install: "curl -L -o tor.tar.gz https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-macos-aarch64-15.0.18.tar.gz && mkdir -p /tmp/tor-expert && tar -xzf tor.tar.gz -C /tmp/tor-expert --strip-components=1"
             tor_bin: "/tmp/tor-expert/tor"
+            tor_dir: "/tmp/tor-expert"
             geoip: "/tmp/tor-expert/geoip"
             geoip6: "/tmp/tor-expert/geoip6"
             pkg: tar.gz
@@ -138,9 +143,22 @@ jobs:
         run: |
           set -euo pipefail
           bundle="dist/bundle/${{ matrix.goos }}-${{ matrix.goarch }}"
-          mkdir -p "$bundle/runtime/tor" "$bundle/runtime/data"
+          mkdir -p "$bundle/runtime/tor" "$bundle/runtime/data" "$bundle/runtime/lib"
           cp "${{ matrix.binary }}" "$bundle/TorCountryManager${{ matrix.exe }}"
-          cp "${{ matrix.tor_bin }}" "$bundle/runtime/tor/tor${{ matrix.exe }}"
+          if [ -n "${{ matrix.tor_dir }}" ]; then
+            cp -R "${{ matrix.tor_dir }}/." "$bundle/runtime/tor/"
+            if [ "${{ matrix.goos }}" = "windows" ]; then
+              find "$bundle/runtime/tor" -mindepth 2 -type f -name '*.dll' -exec cp {} "$bundle/runtime/tor/" \;
+            fi
+          else
+            cp "${{ matrix.tor_bin }}" "$bundle/runtime/tor/tor${{ matrix.exe }}"
+            ldd "${{ matrix.tor_bin }}" | awk '/=> \/[^ ]+/ {print $3}' | while read -r library; do
+              case "$library" in
+                /lib/*/ld-linux-*|/lib/*/libc.so.*|/lib/*/libdl.so.*|/lib/*/libm.so.*|/lib/*/libpthread.so.*|/lib/*/librt.so.*) ;;
+                *) cp -L "$library" "$bundle/runtime/lib/" ;;
+              esac
+            done
+          fi
           cp "${{ matrix.geoip }}" "$bundle/runtime/data/geoip"
           cp "${{ matrix.geoip6 }}" "$bundle/runtime/data/geoip6"
           cat > "$bundle/config.json" <<EOF
@@ -170,15 +188,34 @@ jobs:
           cd /d "%~dp0"
           TorCountryManager.exe -config config.json
           EOF
+          elif [ "${{ matrix.goos }}" = "linux" ]; then
+            cat > "$bundle/start.sh" <<'EOF'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          export LD_LIBRARY_PATH="$PWD/runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec ./TorCountryManager -config config.json
+          EOF
           else
             cat > "$bundle/start.sh" <<'EOF'
           #!/bin/sh
           cd "$(dirname "$0")"
+          export DYLD_LIBRARY_PATH="$PWD/runtime/tor:$PWD/runtime/tor/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
           exec ./TorCountryManager -config config.json
           EOF
             chmod +x "$bundle/start.sh"
           fi
           chmod +x "$bundle/TorCountryManager${{ matrix.exe }}" "$bundle/runtime/tor/tor${{ matrix.exe }}" || true
+      - name: Verify bundled Tor
+        shell: bash
+        run: |
+          bundle="dist/bundle/${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            LD_LIBRARY_PATH="$bundle/runtime/lib" "$bundle/runtime/tor/tor${{ matrix.exe }}" --version
+          elif [ "${{ matrix.goos }}" = "darwin" ]; then
+            DYLD_LIBRARY_PATH="$bundle/runtime/tor:$bundle/runtime/tor/lib" "$bundle/runtime/tor/tor${{ matrix.exe }}" --version
+          else
+            "$bundle/runtime/tor/tor${{ matrix.exe }}" --version
+          fi
       - name: Package bundle
         shell: bash
         run: |

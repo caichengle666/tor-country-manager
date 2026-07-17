@@ -44,7 +44,8 @@ ghcr.io/caichengle666/tor-country-manager:latest
 
 Web 页面和 SOCKS5 代理默认只监听 `127.0.0.1`。不要把无认证 SOCKS5 端口或 Tor 内部端口直接暴露到公网。远程使用时推荐 SSH 隧道或 VPN。
 
-管理员密码以 PBKDF2-SHA256 加盐哈希保存在状态目录的 `web-password.hash`，不会以明文写入配置。上游 SOCKS5 密码和客户端API密钥保存在 `config.json`，请限制该文件的读取权限。通过Web修改代理或客户端API配置后需要重启管理器才能生效。也可以使用环境变量 `TOR_CLIENT_API_KEY` 注入客户端密钥，此时环境变量不会写回配置文件。
+管理员密码以 PBKDF2-SHA256 加盐哈希保存在状态目录的 `web-password.hash`，不会以明文写入配置。上游 SOCKS5 密码和客户端API密钥保存在 `config.json`，请限制该文件的读取权限。通过Web修改上游代理或客户端API密钥会立即生效；监听地址和客户端入口端口仍需重启。也可以使用环境变量 `TOR_CLIENT_API_KEY` 注入客户端密钥，此时环境变量不会写回配置文件。
+已启动国家和已选出口节点保存在状态目录的 `runtime-state.json`。管理器重启后会自动恢复这些路线；手动停止国家或因在线数量限制被停止时，会从恢复列表移除。
 
 切换国家只影响新连接，现有 TCP 连接不会被迁移。`ExitNodes` 和 GeoIP 分类不保证某个国家始终有可用出口，也不保证地理信息绝对准确。
 
@@ -88,7 +89,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://check.torproject.org/api/ip
 
 ## 客户端多国家自动选择
 
-先在Web管理设置中生成客户端API密钥并重启管理器。查询当前可选国家：
+先在Web管理设置中生成客户端API密钥。查询当前可选国家：
 
 ```bash
 curl -H "Authorization: Bearer API密钥" \

@@ -54,6 +54,8 @@ type Manager struct {
 	mu               sync.RWMutex
 	instances        map[string]*Instance
 	allInstances     map[*Instance]struct{}
+	resumeNodes      map[string]PersistedNode
+	resumeActive     string
 	active           string
 	countryProxyCtx  context.Context
 	countryListeners map[string]net.Listener
@@ -61,8 +63,21 @@ type Manager struct {
 	clientAuth       *RuntimeClientAuth
 }
 
+type PersistedNode struct {
+	Country         Country   `json:"country"`
+	ExitFingerprint string    `json:"exit_fingerprint,omitempty"`
+	SelectedIP      string    `json:"selected_ip,omitempty"`
+	SelectedNode    string    `json:"selected_node,omitempty"`
+	StartedAt       time.Time `json:"started_at"`
+}
+
+type persistedManagerState struct {
+	Active    string          `json:"active,omitempty"`
+	Instances []PersistedNode `json:"instances"`
+}
+
 func NewManager(cfg Config) *Manager {
-	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), allInstances: make(map[*Instance]struct{}), countryListeners: make(map[string]net.Listener), clientAuth: NewRuntimeClientAuth(cfg.ClientAPIKey)}
+	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), allInstances: make(map[*Instance]struct{}), resumeNodes: make(map[string]PersistedNode), countryListeners: make(map[string]net.Listener), clientAuth: NewRuntimeClientAuth(cfg.ClientAPIKey)}
 	for index, country := range cfg.Countries {
 		country.Code = normalizeCode(country.Code)
 		m.instances[country.Code] = &Instance{
@@ -73,10 +88,133 @@ func NewManager(cfg Config) *Manager {
 		}
 		m.allInstances[m.instances[country.Code]] = struct{}{}
 	}
+	m.loadRuntimeState()
 	return m
 }
 
 func normalizeCode(code string) string { return strings.ToLower(strings.TrimSpace(code)) }
+
+func (m *Manager) runtimeStatePath() string {
+	return filepath.Join(m.cfg.StateDir, "runtime-state.json")
+}
+
+func (m *Manager) loadRuntimeState() {
+	b, err := os.ReadFile(m.runtimeStatePath())
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		log.Printf("load runtime state: %v", err)
+		return
+	}
+	var state persistedManagerState
+	if err := json.Unmarshal(b, &state); err != nil {
+		log.Printf("load runtime state: %v", err)
+		return
+	}
+	for _, node := range state.Instances {
+		node.Country.Code = normalizeCode(node.Country.Code)
+		if !countryCodePattern.MatchString(node.Country.Code) || (node.ExitFingerprint != "" && !fingerprintPattern.MatchString(node.ExitFingerprint)) {
+			log.Printf("load runtime state: ignoring invalid country or fingerprint")
+			continue
+		}
+		node.ExitFingerprint = strings.ToUpper(node.ExitFingerprint)
+		m.resumeNodes[node.Country.Code] = node
+	}
+	if _, ok := m.resumeNodes[normalizeCode(state.Active)]; ok {
+		m.resumeActive = normalizeCode(state.Active)
+	}
+}
+
+func (m *Manager) saveRuntimeState() {
+	m.mu.RLock()
+	state := persistedManagerState{Active: m.active, Instances: make([]PersistedNode, 0, len(m.resumeNodes))}
+	for _, node := range m.resumeNodes {
+		state.Instances = append(state.Instances, node)
+	}
+	m.mu.RUnlock()
+	sort.Slice(state.Instances, func(i, j int) bool { return state.Instances[i].StartedAt.Before(state.Instances[j].StartedAt) })
+	b, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("save runtime state: %v", err)
+		return
+	}
+	if err := os.MkdirAll(m.cfg.StateDir, 0o750); err != nil {
+		log.Printf("save runtime state: %v", err)
+		return
+	}
+	temporary, err := os.CreateTemp(m.cfg.StateDir, ".runtime-state-*.tmp")
+	if err != nil {
+		log.Printf("save runtime state: %v", err)
+		return
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(append(b, '\n'))
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = replaceFile(temporaryPath, m.runtimeStatePath())
+	}
+	if err != nil {
+		log.Printf("save runtime state: %v", err)
+	}
+}
+
+func (m *Manager) rememberInstance(instance *Instance) {
+	m.mu.Lock()
+	m.resumeNodes[instance.Country.Code] = PersistedNode{
+		Country:         instance.Country,
+		ExitFingerprint: instance.ExitFingerprint,
+		SelectedIP:      instance.SelectedIP,
+		SelectedNode:    instance.SelectedNode,
+		StartedAt:       instance.StartedAt,
+	}
+	m.mu.Unlock()
+	m.saveRuntimeState()
+}
+
+func (m *Manager) forgetInstance(code string) {
+	m.mu.Lock()
+	delete(m.resumeNodes, normalizeCode(code))
+	if m.active == normalizeCode(code) {
+		m.active = ""
+	}
+	m.mu.Unlock()
+	m.saveRuntimeState()
+}
+
+func (m *Manager) Restore() {
+	m.mu.Lock()
+	entries := make([]PersistedNode, 0, len(m.resumeNodes))
+	for _, node := range m.resumeNodes {
+		entries = append(entries, node)
+	}
+	m.active = m.resumeActive
+	m.mu.Unlock()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].StartedAt.Before(entries[j].StartedAt) })
+	for _, node := range entries {
+		instance, err := m.ensureCountry(node.Country)
+		if err != nil {
+			log.Printf("restore %s: %v", node.Country.Code, err)
+			continue
+		}
+		m.mu.Lock()
+		instance.ExitFingerprint = node.ExitFingerprint
+		instance.SelectedIP = node.SelectedIP
+		instance.SelectedNode = node.SelectedNode
+		m.mu.Unlock()
+		if err := m.Start(node.Country.Code); err != nil {
+			log.Printf("restore %s: %v", node.Country.Code, err)
+		}
+	}
+}
 
 func (m *Manager) Start(code string) error {
 	code = normalizeCode(code)
@@ -132,6 +270,7 @@ func (m *Manager) Start(code string) error {
 	instance.StartedAt = time.Now()
 	instance.stopping = false
 	m.mu.Unlock()
+	m.rememberInstance(instance)
 
 	go m.watch(instance, cmd)
 	go m.awaitReady(instance, cmd)
@@ -294,6 +433,7 @@ func (m *Manager) Stop(code string) error {
 		instance.Status = "stopped"
 		instance.Error = ""
 		m.mu.Unlock()
+		m.forgetInstance(code)
 		return nil
 	}
 	if instance.draining {
@@ -306,6 +446,7 @@ func (m *Manager) Stop(code string) error {
 		m.active = ""
 	}
 	m.mu.Unlock()
+	m.forgetInstance(code)
 	go m.drainAndStop(instance)
 	return nil
 }
@@ -594,6 +735,7 @@ func (m *Manager) completeReplacement(current, replacement *Instance, activate b
 			current.Status = "draining"
 			replacement.DrainingConnections = current.ActiveConnections
 			m.mu.Unlock()
+			m.rememberInstance(replacement)
 			go m.drainInstance(current, replacement)
 			return
 		}

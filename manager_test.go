@@ -214,6 +214,69 @@ func TestManagerEnsureCountryReturnsExistingInstance(t *testing.T) {
 	}
 }
 
+func TestManagerPersistsNodesForRestore(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	manager := NewManager(cfg)
+	instance := manager.instances["us"]
+	instance.ExitFingerprint = strings.Repeat("A", 40)
+	instance.SelectedIP = "203.0.113.10"
+	instance.SelectedNode = "test-exit"
+	instance.StartedAt = time.Now().UTC()
+	manager.active = "us"
+	manager.rememberInstance(instance)
+
+	restored := NewManager(cfg)
+	node, ok := restored.resumeNodes["us"]
+	if !ok {
+		t.Fatal("saved node was not loaded")
+	}
+	if node.ExitFingerprint != instance.ExitFingerprint || node.SelectedIP != instance.SelectedIP || node.SelectedNode != instance.SelectedNode {
+		t.Fatalf("loaded node = %#v, want selected node details", node)
+	}
+	if restored.resumeActive != "us" {
+		t.Fatalf("resume active = %q, want us", restored.resumeActive)
+	}
+}
+
+func TestManagerStoppedNodeIsNotRestored(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	manager := NewManager(cfg)
+	instance := manager.instances["us"]
+	instance.ExitFingerprint = strings.Repeat("B", 40)
+	instance.StartedAt = time.Now().UTC()
+	manager.rememberInstance(instance)
+	manager.forgetInstance("us")
+
+	restored := NewManager(cfg)
+	if _, ok := restored.resumeNodes["us"]; ok {
+		t.Fatal("stopped node was loaded for restore")
+	}
+}
+
+func TestManagerRestoreAppliesSavedNode(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.TorBinary = filepath.Join(cfg.StateDir, "missing-tor")
+	manager := NewManager(cfg)
+	instance := manager.instances["us"]
+	instance.ExitFingerprint = strings.Repeat("C", 40)
+	instance.SelectedIP = "203.0.113.11"
+	instance.StartedAt = time.Now().UTC()
+	manager.rememberInstance(instance)
+
+	restored := NewManager(cfg)
+	restored.Restore()
+	restoredInstance, ok := restored.Instance("us")
+	if !ok || restoredInstance.ExitFingerprint != strings.Repeat("C", 40) || restoredInstance.SelectedIP != "203.0.113.11" {
+		t.Fatalf("restore did not apply saved node: %#v", restoredInstance)
+	}
+	if restoredInstance.Status != "error" {
+		t.Fatalf("restore did not attempt to start the saved node, status = %q", restoredInstance.Status)
+	}
+}
+
 func TestManagerUpdateMaxRunningReducesInstances(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.MaxRunning = 10

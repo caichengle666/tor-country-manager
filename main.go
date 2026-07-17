@@ -60,6 +60,7 @@ func main() {
 		}
 	}()
 	manager.StartCountryProxies(ctx)
+	manager.Restore()
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
