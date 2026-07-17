@@ -100,7 +100,8 @@ func TestStateAPIAndWebPage(t *testing.T) {
 	}
 	configStore := NewConfigStore(filepath.Join(t.TempDir(), "config.json"), cfg)
 	manager := NewManager(cfg)
-	handler := routes(manager, NewExitCatalog(cfg), configStore, authStore, cfg)
+	catalog := NewExitCatalog(cfg)
+	handler := routes(manager, catalog, NewRouteHealthMonitor(manager, catalog), configStore, authStore, cfg)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/countries", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

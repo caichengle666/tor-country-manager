@@ -47,6 +47,7 @@ func main() {
 
 	manager := NewManager(cfg)
 	catalog := NewExitCatalog(cfg)
+	healthMonitor := NewRouteHealthMonitor(manager, catalog)
 	configStore := NewConfigStore(*configPath, loaded.Stored)
 	authStore, err := NewAuthStore(cfg)
 	if err != nil {
@@ -62,10 +63,11 @@ func main() {
 	}()
 	manager.StartCountryProxies(ctx)
 	manager.Restore()
+	healthMonitor.Start(ctx)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
-		Handler:           routes(manager, catalog, configStore, authStore, cfg),
+		Handler:           routes(manager, catalog, healthMonitor, configStore, authStore, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -95,8 +97,11 @@ func defaultConfigPath() string {
 	return filepath.Join(filepath.Dir(executable), "config.json")
 }
 
-func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, authStore *AuthStore, cfg Config) http.Handler {
+func routes(manager *Manager, catalog *ExitCatalog, healthMonitor *RouteHealthMonitor, configStore *ConfigStore, authStore *AuthStore, cfg Config) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, healthMonitor.Report())
+	})
 	mux.HandleFunc("GET /api/session", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"configured": authStore.Configured(), "authenticated": authStore.ValidSession(r)})
 	})

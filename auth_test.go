@@ -256,7 +256,9 @@ func TestLoginRouteReturnsTooManyRequests(t *testing.T) {
 	if err := store.Setup("route-rate-limit-password"); err != nil {
 		t.Fatal(err)
 	}
-	handler := routes(NewManager(cfg), NewExitCatalog(cfg), NewConfigStore("", cfg), store, cfg)
+	manager := NewManager(cfg)
+	catalog := NewExitCatalog(cfg)
+	handler := routes(manager, catalog, NewRouteHealthMonitor(manager, catalog), NewConfigStore("", cfg), store, cfg)
 	for attempt := 1; attempt <= loginFailureLimit; attempt++ {
 		request := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"wrong-password"}`))
 		request.RemoteAddr = "192.0.2.20:45678"
