@@ -53,6 +53,18 @@ func TestUpstreamProxyCredentialsMustBePaired(t *testing.T) {
 	}
 }
 
+func TestClientAPIKeyMinimumLength(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ClientAPIKey = "123456"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("six-character client API key was rejected: %v", err)
+	}
+	cfg.ClientAPIKey = "12345"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("five-character client API key was accepted")
+	}
+}
+
 func TestPortsAreStable(t *testing.T) {
 	cfg := defaultConfig()
 	manager := NewManager(cfg)
@@ -131,7 +143,7 @@ func TestStateAPIAndWebPage(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/", nil)
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Tor 国家出口") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Tor 国家出口") || !strings.Contains(response.Body.String(), `id="running-instances"`) {
 		t.Fatalf("web page returned %d", response.Code)
 	}
 }

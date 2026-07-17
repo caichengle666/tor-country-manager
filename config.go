@@ -147,8 +147,8 @@ func (c Config) validate() error {
 	if strings.ContainsAny(c.ClientAPIKey, "\r\n") {
 		return errors.New("client API key cannot contain newlines")
 	}
-	if c.ClientAPIKey != "" && (len(c.ClientAPIKey) < 16 || len(c.ClientAPIKey) > 255) {
-		return errors.New("client API key must be between 16 and 255 characters")
+	if c.ClientAPIKey != "" && (len(c.ClientAPIKey) < 6 || len(c.ClientAPIKey) > 255) {
+		return errors.New("client API key must be between 6 and 255 characters")
 	}
 	if c.MaxRunning < 1 || c.MaxRunning > 32 {
 		return errors.New("max_running must be between 1 and 32")
