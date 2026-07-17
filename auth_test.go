@@ -5,7 +5,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestAuthNotConfiguredByDefault(t *testing.T) {
@@ -203,5 +205,66 @@ func TestAuthRejectsMangledHash(t *testing.T) {
 	}
 	if store2.Verify("real-password") {
 		t.Fatal("mangled hash should not verify")
+	}
+}
+
+func TestAuthLoginRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store, err := NewAuthStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Setup("rate-limit-password"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for attempt := 1; attempt < loginFailureLimit; attempt++ {
+		ok, retryAfter := store.authenticateAt("192.0.2.10", "wrong-password", now)
+		if ok || retryAfter != 0 {
+			t.Fatalf("attempt %d = %v, %v; want false, 0", attempt, ok, retryAfter)
+		}
+	}
+	ok, retryAfter := store.authenticateAt("192.0.2.10", "wrong-password", now)
+	if ok || retryAfter != loginBlockDuration {
+		t.Fatalf("blocking attempt = %v, %v; want false, %v", ok, retryAfter, loginBlockDuration)
+	}
+	if ok, retryAfter := store.authenticateAt("192.0.2.10", "rate-limit-password", now.Add(time.Minute)); ok || retryAfter <= 0 {
+		t.Fatalf("blocked client bypassed limit with correct password: %v, %v", ok, retryAfter)
+	}
+	if ok, retryAfter := store.authenticateAt("192.0.2.11", "rate-limit-password", now.Add(time.Minute)); !ok || retryAfter != 0 {
+		t.Fatalf("different client was rate limited: %v, %v", ok, retryAfter)
+	}
+	if ok, retryAfter := store.authenticateAt("192.0.2.10", "rate-limit-password", now.Add(loginBlockDuration+time.Second)); !ok || retryAfter != 0 {
+		t.Fatalf("client did not recover after block duration: %v, %v", ok, retryAfter)
+	}
+}
+
+func TestLoginRouteReturnsTooManyRequests(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store, err := NewAuthStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Setup("route-rate-limit-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := routes(NewManager(cfg), NewExitCatalog(cfg), NewConfigStore("", cfg), store, cfg)
+	for attempt := 1; attempt <= loginFailureLimit; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"wrong-password"}`))
+		request.RemoteAddr = "192.0.2.20:45678"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		wantStatus := http.StatusUnauthorized
+		if attempt == loginFailureLimit {
+			wantStatus = http.StatusTooManyRequests
+			if recorder.Header().Get("Retry-After") == "" {
+				t.Fatal("rate-limited response did not include Retry-After")
+			}
+		}
+		if recorder.Code != wantStatus {
+			t.Fatalf("attempt %d status = %d, want %d", attempt, recorder.Code, wantStatus)
+		}
 	}
 }

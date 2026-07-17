@@ -24,29 +24,34 @@ import (
 )
 
 type Instance struct {
-	Country             Country   `json:"country"`
-	SocksPort           int       `json:"socks_port"`
-	Status              string    `json:"status"`
-	ExitIP              string    `json:"exit_ip,omitempty"`
-	ExitISP             string    `json:"exit_isp,omitempty"`
-	ExitASN             string    `json:"exit_asn,omitempty"`
-	ExitCountry         string    `json:"exit_country,omitempty"`
-	ExitCountryCode     string    `json:"exit_country_code,omitempty"`
-	ExitCity            string    `json:"exit_city,omitempty"`
-	SelectedIP          string    `json:"selected_ip,omitempty"`
-	SelectedNode        string    `json:"selected_node,omitempty"`
-	ExitFingerprint     string    `json:"exit_fingerprint,omitempty"`
-	Error               string    `json:"error,omitempty"`
-	StartedAt           time.Time `json:"started_at,omitempty"`
-	ActiveConnections   int       `json:"active_connections"`
-	DrainingConnections int       `json:"draining_connections,omitempty"`
-	controlPort         int
-	dataDir             string
-	cancelRotation      context.CancelFunc
-	cmd                 *exec.Cmd
-	stopping            bool
-	draining            bool
-	replacement         bool
+	Country                   Country   `json:"country"`
+	SocksPort                 int       `json:"socks_port"`
+	Status                    string    `json:"status"`
+	BootstrapProgress         int       `json:"bootstrap_progress"`
+	ExitIP                    string    `json:"exit_ip,omitempty"`
+	ExitISP                   string    `json:"exit_isp,omitempty"`
+	ExitASN                   string    `json:"exit_asn,omitempty"`
+	ExitCountry               string    `json:"exit_country,omitempty"`
+	ExitCountryCode           string    `json:"exit_country_code,omitempty"`
+	ExitCity                  string    `json:"exit_city,omitempty"`
+	SelectedIP                string    `json:"selected_ip,omitempty"`
+	SelectedNode              string    `json:"selected_node,omitempty"`
+	ExitFingerprint           string    `json:"exit_fingerprint,omitempty"`
+	Error                     string    `json:"error,omitempty"`
+	StartedAt                 time.Time `json:"started_at,omitempty"`
+	ActiveConnections         int       `json:"active_connections"`
+	DrainingConnections       int       `json:"draining_connections,omitempty"`
+	controlPort               int
+	dataDir                   string
+	cancelRotation            context.CancelFunc
+	cmd                       *exec.Cmd
+	stopping                  bool
+	draining                  bool
+	replacement               bool
+	replacementSequence       uint64
+	replacementPreviousStatus string
+	replacementPreviousError  string
+	pendingReplacement        *Instance
 }
 
 type Manager struct {
@@ -260,6 +265,7 @@ func (m *Manager) Start(code string) error {
 	instance.cmd = cmd
 	m.allInstances[instance] = struct{}{}
 	instance.Status = "starting"
+	instance.BootstrapProgress = 0
 	instance.Error = ""
 	instance.ExitIP = ""
 	instance.ExitISP = ""
@@ -373,9 +379,11 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 		if err == nil {
 			_ = conn.Close()
 			m.mu.Lock()
-			if instance.cmd == cmd && instance.Status == "starting" {
-				instance.Status = "connecting"
+			if instance.cmd != cmd || instance.Status != "starting" {
+				m.mu.Unlock()
+				return
 			}
+			instance.Status = "connecting"
 			m.mu.Unlock()
 			if err := m.applyUpstream(instance, m.upstreamConfig()); err != nil {
 				m.mu.Lock()
@@ -402,13 +410,14 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 func (m *Manager) awaitBootstrap(instance *Instance, cmd *exec.Cmd) {
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		if m.refreshInstanceExitIP(instance) {
-			return
-		}
 		m.mu.RLock()
 		stillConnecting := instance.cmd == cmd && instance.Status == "connecting"
 		m.mu.RUnlock()
 		if !stillConnecting {
+			return
+		}
+		m.refreshBootstrapProgress(instance)
+		if m.refreshInstanceExitIP(instance, cmd) {
 			return
 		}
 		time.Sleep(4 * time.Second)
@@ -429,15 +438,29 @@ func (m *Manager) Stop(code string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("unknown country %q", code)
 	}
+	replacement := instance.pendingReplacement
+	if replacement != nil {
+		instance.replacementSequence++
+		instance.replacement = false
+		instance.replacementPreviousStatus = ""
+		instance.replacementPreviousError = ""
+		instance.pendingReplacement = nil
+	}
 	if instance.cmd == nil || instance.cmd.Process == nil {
 		instance.Status = "stopped"
 		instance.Error = ""
 		m.mu.Unlock()
+		if replacement != nil {
+			m.stopInstance(replacement)
+		}
 		m.forgetInstance(code)
 		return nil
 	}
 	if instance.draining {
 		m.mu.Unlock()
+		if replacement != nil {
+			m.stopInstance(replacement)
+		}
 		return nil
 	}
 	instance.draining = true
@@ -446,6 +469,9 @@ func (m *Manager) Stop(code string) error {
 		m.active = ""
 	}
 	m.mu.Unlock()
+	if replacement != nil {
+		m.stopInstance(replacement)
+	}
 	m.forgetInstance(code)
 	go m.drainAndStop(instance)
 	return nil
@@ -467,6 +493,10 @@ func (m *Manager) drainAndStop(instance *Instance) {
 
 func (m *Manager) stopInstance(instance *Instance) {
 	m.mu.Lock()
+	if instance.stopping {
+		m.mu.Unlock()
+		return
+	}
 	if instance.cancelRotation != nil {
 		instance.cancelRotation()
 		instance.cancelRotation = nil
@@ -639,10 +669,13 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 		return err
 	}
 	m.mu.Lock()
-	if current.replacement {
-		m.mu.Unlock()
-		return errors.New("a replacement instance is already starting for this country")
+	previous := current.pendingReplacement
+	if !current.replacement {
+		current.replacementPreviousStatus = current.Status
+		current.replacementPreviousError = current.Error
 	}
+	current.replacementSequence++
+	sequence := current.replacementSequence
 	current.replacement = true
 	current.Status = "switching"
 	replacement := &Instance{
@@ -654,17 +687,91 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 		SelectedIP:      node.IP,
 		SelectedNode:    node.Nickname,
 	}
+	current.pendingReplacement = replacement
 	m.mu.Unlock()
+	if previous != nil {
+		m.stopInstance(previous)
+	}
 	if err := m.startDetached(replacement, fmt.Sprintf("replacement-%d", time.Now().UnixNano())); err != nil {
 		m.mu.Lock()
-		current.replacement = false
-		current.Status = "running"
-		current.Error = "replacement failed: " + err.Error()
+		var retryCmd *exec.Cmd
+		retryStatus := ""
+		if current.replacementSequence == sequence && current.pendingReplacement == replacement {
+			retryCmd, retryStatus = restoreAfterReplacementLocked(current, "replacement failed: "+err.Error())
+		}
 		m.mu.Unlock()
+		m.resumeAfterReplacement(current, retryCmd, retryStatus)
 		return err
 	}
-	go m.completeReplacement(current, replacement, activate)
+	go m.completeReplacement(current, replacement, activate, sequence)
 	return nil
+}
+
+func (m *Manager) CancelReplacement(code string) error {
+	code = normalizeCode(code)
+	m.mu.Lock()
+	current, ok := m.instances[code]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("unknown country %q", code)
+	}
+	replacement := current.pendingReplacement
+	if !current.replacement || replacement == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	current.replacementSequence++
+	retryCmd, retryStatus := restoreAfterReplacementLocked(current, "")
+	m.mu.Unlock()
+	m.stopInstance(replacement)
+	m.resumeAfterReplacement(current, retryCmd, retryStatus)
+	return nil
+}
+
+func restoreAfterReplacementLocked(current *Instance, message string) (*exec.Cmd, string) {
+	status := current.replacementPreviousStatus
+	if status == "" || status == "switching" {
+		status = "running"
+	}
+	previousError := current.replacementPreviousError
+	current.replacement = false
+	current.replacementPreviousStatus = ""
+	current.replacementPreviousError = ""
+	current.pendingReplacement = nil
+	cmd := current.cmd
+	if cmd == nil || cmd.Process == nil || current.stopping || current.draining {
+		status = current.Status
+		previousError = current.Error
+		if status != "error" && status != "stopped" && status != "stopping" {
+			status = "error"
+			previousError = "old Tor instance is no longer running"
+		}
+		if message != "" {
+			if previousError != "" {
+				previousError += "; " + message
+			} else {
+				previousError = message
+			}
+		}
+		current.Status = status
+		current.Error = previousError
+		return nil, ""
+	}
+	current.Status = status
+	if message == "" {
+		message = previousError
+	}
+	current.Error = message
+	return cmd, status
+}
+
+func (m *Manager) resumeAfterReplacement(current *Instance, cmd *exec.Cmd, status string) {
+	switch status {
+	case "starting":
+		go m.awaitReady(current, cmd)
+	case "connecting":
+		go m.awaitBootstrap(current, cmd)
+	}
 }
 
 func availableLocalPort() (int, error) {
@@ -701,10 +808,11 @@ func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start replacement tor: %w", err)
 	}
+	m.mu.Lock()
 	instance.cmd = cmd
 	instance.Status = "starting"
+	instance.BootstrapProgress = 0
 	instance.StartedAt = time.Now()
-	m.mu.Lock()
 	m.allInstances[instance] = struct{}{}
 	m.mu.Unlock()
 	go m.watch(instance, cmd)
@@ -712,15 +820,20 @@ func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	return nil
 }
 
-func (m *Manager) completeReplacement(current, replacement *Instance, activate bool) {
+func (m *Manager) completeReplacement(current, replacement *Instance, activate bool, sequence uint64) {
 	deadline := time.Now().Add(4 * time.Minute)
 	for time.Now().Before(deadline) {
 		m.mu.RLock()
 		status := replacement.Status
+		currentReplacement := current.replacementSequence == sequence && current.pendingReplacement == replacement
 		m.mu.RUnlock()
+		if !currentReplacement {
+			m.stopInstance(replacement)
+			return
+		}
 		if status == "running" {
 			m.mu.Lock()
-			if m.instances[current.Country.Code] != current {
+			if m.instances[current.Country.Code] != current || current.replacementSequence != sequence || current.pendingReplacement != replacement {
 				m.mu.Unlock()
 				m.stopInstance(replacement)
 				return
@@ -731,6 +844,9 @@ func (m *Manager) completeReplacement(current, replacement *Instance, activate b
 				m.active = current.Country.Code
 			}
 			current.replacement = false
+			current.replacementPreviousStatus = ""
+			current.replacementPreviousError = ""
+			current.pendingReplacement = nil
 			current.draining = true
 			current.Status = "draining"
 			replacement.DrainingConnections = current.ActiveConnections
@@ -745,11 +861,14 @@ func (m *Manager) completeReplacement(current, replacement *Instance, activate b
 		time.Sleep(500 * time.Millisecond)
 	}
 	m.mu.Lock()
-	current.replacement = false
-	current.Status = "running"
-	current.Error = "replacement instance did not become ready; old route was preserved"
+	var retryCmd *exec.Cmd
+	retryStatus := ""
+	if current.replacementSequence == sequence && current.pendingReplacement == replacement {
+		retryCmd, retryStatus = restoreAfterReplacementLocked(current, "replacement instance did not become ready; old route was preserved")
+	}
 	m.mu.Unlock()
 	m.stopInstance(replacement)
+	m.resumeAfterReplacement(current, retryCmd, retryStatus)
 }
 
 func (m *Manager) drainInstance(old, current *Instance) {
@@ -820,6 +939,34 @@ func (m *Manager) controlCommand(instance *Instance, command string) (string, er
 		return "", fmt.Errorf("read control response: %w", err)
 	}
 	return line, nil
+}
+
+func parseBootstrapProgress(response string) (int, bool) {
+	match := bootstrapProgressPattern.FindStringSubmatch(response)
+	if len(match) != 2 {
+		return 0, false
+	}
+	progress, err := strconv.Atoi(match[1])
+	if err != nil || progress < 0 || progress > 100 {
+		return 0, false
+	}
+	return progress, true
+}
+
+func (m *Manager) refreshBootstrapProgress(instance *Instance) {
+	response, err := m.controlCommand(instance, "GETINFO status/bootstrap-phase")
+	if err != nil {
+		return
+	}
+	progress, ok := parseBootstrapProgress(response)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	if progress > instance.BootstrapProgress {
+		instance.BootstrapProgress = progress
+	}
+	m.mu.Unlock()
 }
 
 func controlValue(value string) string {
@@ -973,6 +1120,7 @@ func (m *Manager) Instance(code string) (Instance, bool) {
 }
 
 var fingerprintPattern = regexp.MustCompile(`^[A-Fa-f0-9]{40}$`)
+var bootstrapProgressPattern = regexp.MustCompile(`\bPROGRESS=([0-9]{1,3})\b`)
 
 type State struct {
 	Active       string     `json:"active"`
@@ -988,6 +1136,11 @@ func (m *Manager) State() State {
 	for _, configured := range m.cfg.Countries {
 		instance := m.instances[normalizeCode(configured.Code)]
 		copy := *instance
+		if instance.Status == "switching" && instance.pendingReplacement != nil {
+			copy.BootstrapProgress = instance.pendingReplacement.BootstrapProgress
+			copy.SelectedIP = instance.pendingReplacement.SelectedIP
+			copy.SelectedNode = instance.pendingReplacement.SelectedNode
+		}
 		copy.cmd = nil
 		state.Instances = append(state.Instances, copy)
 	}
@@ -1008,7 +1161,7 @@ func (m *Manager) Shutdown() {
 	}
 }
 
-func (m *Manager) refreshInstanceExitIP(instance *Instance) bool {
+func (m *Manager) refreshInstanceExitIP(instance *Instance, cmd *exec.Cmd) bool {
 	m.mu.RLock()
 	port := instance.SocksPort
 	m.mu.RUnlock()
@@ -1035,13 +1188,24 @@ func (m *Manager) refreshInstanceExitIP(instance *Instance) bool {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result); err != nil || !result.IsTor {
 		return false
 	}
-	m.mu.Lock()
-	instance.ExitIP = result.IP
-	instance.Status = "running"
-	instance.Error = ""
-	m.mu.Unlock()
+	if !m.markInstanceRunning(instance, cmd, result.IP) {
+		return false
+	}
 	m.startCircuitRotation(instance)
 	m.lookupExitInfo(client, instance, result.IP)
+	return true
+}
+
+func (m *Manager) markInstanceRunning(instance *Instance, cmd *exec.Cmd, exitIP string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if instance.cmd != cmd || instance.Status != "connecting" {
+		return false
+	}
+	instance.ExitIP = exitIP
+	instance.Status = "running"
+	instance.BootstrapProgress = 100
+	instance.Error = ""
 	return true
 }
 

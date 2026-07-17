@@ -405,3 +405,114 @@ func TestTorrcEscapesUpstreamCredentials(t *testing.T) {
 		t.Fatalf("password was not escaped in torrc: %s", torrc)
 	}
 }
+
+func TestParseBootstrapProgress(t *testing.T) {
+	response := "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=63 TAG=loading_descriptors SUMMARY=Loading relay descriptors\r\n"
+	progress, ok := parseBootstrapProgress(response)
+	if !ok || progress != 63 {
+		t.Fatalf("parseBootstrapProgress() = %d, %v, want 63, true", progress, ok)
+	}
+	if _, ok := parseBootstrapProgress("250 OK\r\n"); ok {
+		t.Fatal("response without bootstrap progress was accepted")
+	}
+	if _, ok := parseBootstrapProgress("PROGRESS=101"); ok {
+		t.Fatal("out-of-range bootstrap progress was accepted")
+	}
+}
+
+func TestCancelReplacementPreservesCurrentInstance(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	current := manager.instances["us"]
+	current.cmd = &exec.Cmd{Process: &os.Process{Pid: -1}}
+	current.Status = "switching"
+	current.replacement = true
+	current.replacementSequence = 1
+	current.replacementPreviousStatus = "running"
+	replacement := &Instance{Country: current.Country, Status: "starting"}
+	current.pendingReplacement = replacement
+
+	if err := manager.CancelReplacement("us"); err != nil {
+		t.Fatal(err)
+	}
+	if current.replacement || current.pendingReplacement != nil || current.Status != "running" {
+		t.Fatalf("current instance was not restored: %#v", current)
+	}
+	if replacement.Status != "stopped" {
+		t.Fatalf("replacement status = %q, want stopped", replacement.Status)
+	}
+}
+
+func TestCancelReplacementDoesNotRestoreMissingCurrentInstance(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	current := manager.instances["us"]
+	current.Status = "error"
+	current.Error = "Tor exited unexpectedly"
+	current.replacement = true
+	current.replacementSequence = 1
+	current.replacementPreviousStatus = "running"
+	current.pendingReplacement = &Instance{Country: current.Country, Status: "starting"}
+
+	if err := manager.CancelReplacement("us"); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "error" || current.Error != "Tor exited unexpectedly" {
+		t.Fatalf("missing current instance restored as status %q with error %q", current.Status, current.Error)
+	}
+}
+
+func TestCancelReplacementRestoresConnectingInstance(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	current := manager.instances["us"]
+	current.cmd = &exec.Cmd{Process: &os.Process{Pid: -1}}
+	current.Status = "switching"
+	current.replacement = true
+	current.replacementSequence = 1
+	current.replacementPreviousStatus = "connecting"
+	current.replacementPreviousError = "old connection warning"
+	current.pendingReplacement = &Instance{Country: current.Country, Status: "starting"}
+
+	if err := manager.CancelReplacement("us"); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "connecting" || current.Error != "old connection warning" {
+		t.Fatalf("cancel restored status %q and error %q, want connecting and prior error", current.Status, current.Error)
+	}
+}
+
+func TestExitCheckCannotOverwriteSwitchingState(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	current := manager.instances["us"]
+	cmd := &exec.Cmd{Process: &os.Process{Pid: -1}}
+	current.cmd = cmd
+	current.Status = "switching"
+
+	if manager.markInstanceRunning(current, cmd, "203.0.113.8") || current.Status != "switching" {
+		t.Fatalf("stale exit check overwrote status with %q", current.Status)
+	}
+}
+
+func TestReplaceNodeOverridesPendingReplacement(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.TorBinary = filepath.Join(cfg.StateDir, "missing-tor")
+	manager := NewManager(cfg)
+	current := manager.instances["us"]
+	current.cmd = &exec.Cmd{Process: &os.Process{Pid: -1}}
+	current.Status = "switching"
+	current.replacement = true
+	current.replacementSequence = 1
+	previous := &Instance{Country: current.Country, Status: "starting"}
+	current.pendingReplacement = previous
+
+	node := ExitNode{CountryCode: "us", CountryName: "United States", Fingerprint: strings.Repeat("D", 40), IP: "203.0.113.12", Nickname: "replacement"}
+	err := manager.replaceNode(current, node, true)
+	if err == nil || strings.Contains(err.Error(), "already starting") {
+		t.Fatalf("replaceNode() error = %v, want start failure after overriding pending replacement", err)
+	}
+	if previous.Status != "stopped" {
+		t.Fatalf("previous replacement status = %q, want stopped", previous.Status)
+	}
+	if current.replacement || current.pendingReplacement != nil || current.Status != "running" {
+		t.Fatalf("current instance was not preserved after replacement start failure: %#v", current)
+	}
+}

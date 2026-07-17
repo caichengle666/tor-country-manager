@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -125,7 +126,14 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 			writeError(w, err)
 			return
 		}
-		if !authStore.Verify(input.Password) {
+		authenticated, retryAfter := authStore.Authenticate(loginClientKey(r), input.Password)
+		if retryAfter > 0 {
+			seconds := int((retryAfter + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts; try again later"})
+			return
+		}
+		if !authenticated {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "administrator password is incorrect"})
 			return
 		}
@@ -251,6 +259,13 @@ func routes(manager *Manager, catalog *ExitCatalog, configStore *ConfigStore, au
 	})
 	mux.HandleFunc("POST /api/countries/{code}/stop", func(w http.ResponseWriter, r *http.Request) {
 		if err := manager.Stop(r.PathValue("code")); err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, manager.State())
+	})
+	mux.HandleFunc("POST /api/countries/{code}/cancel-switch", func(w http.ResponseWriter, r *http.Request) {
+		if err := manager.CancelReplacement(r.PathValue("code")); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -415,6 +430,14 @@ func sameOriginRequest(r *http.Request) bool {
 	}
 	parsed, err := url.Parse(origin)
 	return err == nil && parsed.Host == r.Host && (parsed.Scheme == "http" || parsed.Scheme == "https")
+}
+
+func loginClientKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func decodeJSON(r *http.Request, target any) error {

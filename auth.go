@@ -19,24 +19,35 @@ import (
 )
 
 const (
-	passwordIterations = 210000
-	sessionCookieName  = "tor_manager_session"
-	sessionLifetime    = 12 * time.Hour
+	passwordIterations  = 210000
+	sessionCookieName   = "tor_manager_session"
+	sessionLifetime     = 12 * time.Hour
+	loginFailureLimit   = 5
+	loginBlockDuration  = 5 * time.Minute
+	loginRecordLifetime = 15 * time.Minute
 )
 
+type loginAttempt struct {
+	Failures     int
+	BlockedUntil time.Time
+	LastSeen     time.Time
+}
+
 type AuthStore struct {
-	mu       sync.RWMutex
-	hashPath string
-	legacy   string
-	hash     string
-	sessions map[string]time.Time
+	mu            sync.RWMutex
+	hashPath      string
+	legacy        string
+	hash          string
+	sessions      map[string]time.Time
+	loginAttempts map[string]loginAttempt
 }
 
 func NewAuthStore(cfg Config) (*AuthStore, error) {
 	store := &AuthStore{
-		hashPath: filepath.Join(cfg.StateDir, "web-password.hash"),
-		legacy:   cfg.AuthToken,
-		sessions: make(map[string]time.Time),
+		hashPath:      filepath.Join(cfg.StateDir, "web-password.hash"),
+		legacy:        cfg.AuthToken,
+		sessions:      make(map[string]time.Time),
+		loginAttempts: make(map[string]loginAttempt),
 	}
 	b, err := os.ReadFile(store.hashPath)
 	if err == nil {
@@ -101,6 +112,44 @@ func (a *AuthStore) Verify(password string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.verifyLocked(password)
+}
+
+func (a *AuthStore) Authenticate(client, password string) (bool, time.Duration) {
+	return a.authenticateAt(client, password, time.Now())
+}
+
+func (a *AuthStore) authenticateAt(client, password string, now time.Time) (bool, time.Duration) {
+	if client == "" {
+		client = "unknown"
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, attempt := range a.loginAttempts {
+		if now.Sub(attempt.LastSeen) > loginRecordLifetime {
+			delete(a.loginAttempts, key)
+		}
+	}
+	attempt := a.loginAttempts[client]
+	if now.Before(attempt.BlockedUntil) {
+		attempt.LastSeen = now
+		a.loginAttempts[client] = attempt
+		return false, attempt.BlockedUntil.Sub(now)
+	}
+	if a.verifyLocked(password) {
+		delete(a.loginAttempts, client)
+		return true, 0
+	}
+	attempt.Failures++
+	attempt.LastSeen = now
+	if attempt.Failures >= loginFailureLimit {
+		attempt.Failures = 0
+		attempt.BlockedUntil = now.Add(loginBlockDuration)
+	}
+	a.loginAttempts[client] = attempt
+	if now.Before(attempt.BlockedUntil) {
+		return false, attempt.BlockedUntil.Sub(now)
+	}
+	return false, 0
 }
 
 func (a *AuthStore) verifyLocked(password string) bool {
