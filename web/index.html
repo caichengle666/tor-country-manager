@@ -61,7 +61,7 @@
 
 <div id="settings-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
   <section class="modal" style="width:min(620px,100%)">
-    <header class="modal-head"><div><h2 id="settings-title">管理设置</h2><div class="muted">在线数量立即生效；修改代理配置后需要重启管理器</div></div><button id="settings-close" class="modal-close">关闭</button></header>
+    <header class="modal-head"><div><h2 id="settings-title">管理设置</h2><div class="muted">运行设置立即生效；监听地址和端口修改后需要重启管理器</div></div><button id="settings-close" class="modal-close">关闭</button></header>
     <div class="settings-body">
       <section class="form-section"><h3>在线国家数量</h3><form id="runtime-form" class="form">
         <label>最多同时在线国家数（1～32）<input id="max-running" type="number" min="1" max="32" step="1" required></label>
@@ -99,7 +99,17 @@
 const $=s=>document.querySelector(s), countriesEl=$('#countries'), runningInstances=$('#running-instances'), notice=$('#notice'), modal=$('#node-modal'), nodeList=$('#node-list'), authScreen=$('#auth-screen'), settingsModal=$('#settings-modal');
 let stateCache={active:'',proxy_address:'',instances:[]}, catalog=[], openCountry='', nodePoll=null, authMode='login';
 const labels={stopped:'已停止',starting:'正在启动',connecting:'正在连接 Tor 网络',switching:'正在切换节点，请稍候',running:'运行中',stopping:'正在停止',error:'错误'};
-async function api(path,options={}){options.headers={...(options.headers||{}),'Content-Type':'application/json'};options.credentials='same-origin';const response=await fetch(path,options);const data=await response.json();if(response.status===401&&path!=='/api/login'){showAuth('login')}if(!response.ok)throw new Error(data.error||'请求失败');return data}
+async function api(path,options={}){
+  options.headers={...(options.headers||{}),'Content-Type':'application/json'};options.credentials='same-origin';
+  let response;
+  try{response=await fetch(path,options)}catch{throw new Error('无法连接管理器，请确认服务仍在运行')}
+  const body=await response.text();let data;
+  try{data=body?JSON.parse(body):null}catch{throw new Error(response.ok?'管理器返回了无法识别的响应':`请求失败（HTTP ${response.status}）`)}
+  if(response.status===401&&path!=='/api/login')showAuth('login');
+  if(!response.ok)throw new Error(data?.error||`请求失败（HTTP ${response.status}）`);
+  if(data===null)throw new Error('管理器返回了空响应');
+  return data;
+}
 function escapeHTML(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
 function showError(error){notice.textContent=error.message||String(error);notice.style.display='block'}
 function showAuth(mode){authMode=mode;authScreen.classList.add('open');$('#auth-error').textContent='';$('#auth-password').value='';$('#auth-confirm').value='';const setup=mode==='setup';$('#auth-title').textContent=setup?'设置管理员密码':'管理员登录';$('#auth-subtitle').textContent=setup?'首次使用，请设置至少8位的Web管理密码':'请输入Web管理密码';$('#auth-confirm-row').style.display=setup?'grid':'none';$('#auth-submit').textContent=setup?'设置密码并登录':'登录';$('#auth-password').autocomplete=setup?'new-password':'current-password'}

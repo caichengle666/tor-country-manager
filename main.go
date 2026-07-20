@@ -69,6 +69,8 @@ func main() {
 		Addr:              cfg.ListenAddress,
 		Handler:           routes(manager, catalog, healthMonitor, configStore, authStore, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
