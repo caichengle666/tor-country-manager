@@ -387,6 +387,26 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 		m.active = ""
 	}
 	m.mu.Unlock()
+	if dir := replacementInstanceDir(instance.dataDir); dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// replacementInstanceDir reports whether dataDir belongs to a throwaway
+// replacement instance directory (named <code>-replacement-<timestamp>) and
+// returns that directory's path so the caller can remove it once the Tor
+// process has exited. It returns "" for resident instance directories, which
+// must be kept so Start can reuse them.
+func replacementInstanceDir(dataDir string) string {
+	if dataDir == "" {
+		return ""
+	}
+	dir := filepath.Dir(dataDir)
+	name := filepath.Base(dir)
+	if !strings.Contains(name, "-replacement-") {
+		return ""
+	}
+	return dir
 }
 
 func (m *Manager) autoRestartEligibleLocked(instance *Instance) bool {

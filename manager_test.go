@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -514,6 +515,52 @@ func TestReplaceNodeOverridesPendingReplacement(t *testing.T) {
 	}
 	if current.replacement || current.pendingReplacement != nil || current.Status != "running" {
 		t.Fatalf("current instance was not preserved after replacement start failure: %#v", current)
+	}
+}
+
+func TestWatchRemovesReplacementDirectory(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	manager.cfg.StateDir = t.TempDir()
+	code := "us"
+	replacementDir := filepath.Join(manager.cfg.StateDir, code+"-replacement-1700000000000000000")
+	dataDir := filepath.Join(replacementDir, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "cache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "marker"), []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instance := manager.instances[code]
+	instance.dataDir = dataDir
+	instance.stopping = true
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "exit", "0")
+	} else {
+		cmd = exec.Command("true")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	instance.cmd = cmd
+	manager.watch(instance, cmd)
+	if _, err := os.Stat(replacementDir); !os.IsNotExist(err) {
+		t.Fatalf("replacement directory still exists after watch; err=%v", err)
+	}
+}
+
+func TestReplacementInstanceDir(t *testing.T) {
+	resident := filepath.Join("state", "us", "data")
+	if got := replacementInstanceDir(resident); got != "" {
+		t.Fatalf("resident dir returned %q, want empty", got)
+	}
+	replacement := filepath.Join("state", "us-replacement-1700000000000000000", "data")
+	want := filepath.Join("state", "us-replacement-1700000000000000000")
+	if got := replacementInstanceDir(replacement); got != want {
+		t.Fatalf("replacement dir returned %q, want %q", got, want)
+	}
+	if got := replacementInstanceDir(""); got != "" {
+		t.Fatalf("empty dataDir returned %q, want empty", got)
 	}
 }
 
