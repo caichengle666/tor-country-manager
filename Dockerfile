@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go test ./... && \
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends tor tor-geoipdb ca-certificates && \
+    apt-get install -y --no-install-recommends tor tor-geoipdb ca-certificates busybox && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin tor-manager && \
     mkdir -p /app /data && chown -R tor-manager:tor-manager /data
@@ -19,4 +19,6 @@ COPY --chmod=0755 deploy/docker/entrypoint.sh /usr/local/bin/docker-entrypoint.s
 USER tor-manager
 VOLUME ["/data"]
 EXPOSE 8080 1080 20000-20675
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

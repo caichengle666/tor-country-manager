@@ -11,6 +11,7 @@ StateDirectory=tor-country-manager
 ExecStart=/usr/local/bin/tor-country-manager -config /var/lib/tor-country-manager/config.json
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

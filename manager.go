@@ -58,6 +58,8 @@ type Instance struct {
 type Manager struct {
 	cfg              Config
 	mu               sync.RWMutex
+	stateMu          sync.Mutex
+	dirMu            sync.Mutex
 	instances        map[string]*Instance
 	allInstances     map[*Instance]struct{}
 	resumeNodes      map[string]PersistedNode
@@ -136,6 +138,9 @@ func (m *Manager) loadRuntimeState() {
 }
 
 func (m *Manager) saveRuntimeState() {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
 	m.mu.RLock()
 	state := persistedManagerState{Active: m.active, Instances: make([]PersistedNode, 0, len(m.resumeNodes))}
 	for _, node := range m.resumeNodes {
@@ -240,15 +245,22 @@ func (m *Manager) Start(code string) error {
 		m.mu.Unlock()
 		return nil
 	}
-	cmd, err := m.prepareTorCommand(instance, filepath.Join(m.cfg.StateDir, code))
+	if instance.cmd != nil {
+		m.mu.Unlock()
+		return errors.New("previous Tor process has not exited yet")
+	}
+	instanceDir := filepath.Join(m.cfg.StateDir, code)
+	cmd, err := m.prepareTorCommand(instance, instanceDir)
 	if err != nil {
 		m.mu.Unlock()
+		m.removeInstanceDir(instanceDir)
 		return err
 	}
 	if err := cmd.Start(); err != nil {
 		instance.Status = "error"
 		instance.Error = err.Error()
 		m.mu.Unlock()
+		m.removeInstanceDir(instanceDir)
 		return fmt.Errorf("start tor: %w", err)
 	}
 	instance.cmd = cmd
@@ -268,7 +280,7 @@ func (m *Manager) Start(code string) error {
 	m.mu.Unlock()
 	m.rememberInstance(instance)
 
-	go m.watch(instance, cmd)
+	go m.watch(instance, cmd, instanceDir)
 	go m.awaitReady(instance, cmd)
 	return nil
 }
@@ -336,6 +348,9 @@ func (m *Manager) torrc(instance *Instance, dataDir, logDir string) string {
 }
 
 func (m *Manager) prepareTorCommand(instance *Instance, instanceDir string) (*exec.Cmd, error) {
+	m.dirMu.Lock()
+	defer m.dirMu.Unlock()
+
 	dataDir := filepath.Join(instanceDir, "data")
 	logDir := filepath.Join(instanceDir, "logs")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -355,11 +370,12 @@ func (m *Manager) prepareTorCommand(instance *Instance, instanceDir string) (*ex
 	return cmd, nil
 }
 
-func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
+func (m *Manager) watch(instance *Instance, cmd *exec.Cmd, instanceDir string) {
 	err := cmd.Wait()
 	m.mu.Lock()
 	if instance.cmd != cmd {
 		m.mu.Unlock()
+		m.removeInstanceDir(instanceDir)
 		return
 	}
 	instance.cmd = nil
@@ -376,6 +392,10 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 		}
 	}
 	instance.stopping = false
+	m.mu.Unlock()
+	m.removeInstanceDir(instanceDir)
+
+	m.mu.Lock()
 	if !instance.draining && m.scheduleAutoRestartLocked(instance, instance.Error) {
 		m.mu.Unlock()
 		return
@@ -383,30 +403,48 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd) {
 	if !m.shuttingDown && m.instances[instance.Country.Code] == instance && instance.restartAttempts >= autoRestartLimit {
 		instance.Error += "; automatic restart limit reached"
 	}
-	if current := m.instances[instance.Country.Code]; current == instance && m.active == instance.Country.Code {
+	if current := m.instances[instance.Country.Code]; current == instance && instance.cmd == nil && m.active == instance.Country.Code {
 		m.active = ""
 	}
 	m.mu.Unlock()
-	if dir := replacementInstanceDir(instance.dataDir); dir != "" {
-		_ = os.RemoveAll(dir)
+}
+
+func (m *Manager) removeInstanceDir(dir string) {
+	if dir == "" {
+		return
+	}
+	m.dirMu.Lock()
+	err := os.RemoveAll(dir)
+	m.dirMu.Unlock()
+	if err != nil {
+		log.Printf("remove Tor instance directory %s: %v", dir, err)
 	}
 }
 
-// replacementInstanceDir reports whether dataDir belongs to a throwaway
-// replacement instance directory (named <code>-replacement-<timestamp>) and
-// returns that directory's path so the caller can remove it once the Tor
-// process has exited. It returns "" for resident instance directories, which
-// must be kept so Start can reuse them.
-func replacementInstanceDir(dataDir string) string {
-	if dataDir == "" {
-		return ""
+var instanceDirPattern = regexp.MustCompile(`^[a-z]{2}(?:-replacement-[0-9]+)?$`)
+
+func (m *Manager) CleanupStaleInstanceDirs() error {
+	entries, err := os.ReadDir(m.cfg.StateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	dir := filepath.Dir(dataDir)
-	name := filepath.Base(dir)
-	if !strings.Contains(name, "-replacement-") {
-		return ""
+	if err != nil {
+		return fmt.Errorf("scan stale Tor instance directories: %w", err)
 	}
-	return dir
+	var cleanupErrors []error
+	for _, entry := range entries {
+		if !entry.IsDir() || !instanceDirPattern.MatchString(entry.Name()) {
+			continue
+		}
+		dir := filepath.Join(m.cfg.StateDir, entry.Name())
+		m.dirMu.Lock()
+		err := os.RemoveAll(dir)
+		m.dirMu.Unlock()
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove %s: %w", dir, err))
+		}
+	}
+	return errors.Join(cleanupErrors...)
 }
 
 func (m *Manager) autoRestartEligibleLocked(instance *Instance) bool {
@@ -876,11 +914,14 @@ func availableLocalPort() (int, error) {
 
 func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	code := instance.Country.Code
-	cmd, err := m.prepareTorCommand(instance, filepath.Join(m.cfg.StateDir, code+"-"+suffix))
+	instanceDir := filepath.Join(m.cfg.StateDir, code+"-"+suffix)
+	cmd, err := m.prepareTorCommand(instance, instanceDir)
 	if err != nil {
+		m.removeInstanceDir(instanceDir)
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		m.removeInstanceDir(instanceDir)
 		return fmt.Errorf("start replacement tor: %w", err)
 	}
 	m.mu.Lock()
@@ -890,7 +931,7 @@ func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	instance.StartedAt = time.Now()
 	m.allInstances[instance] = struct{}{}
 	m.mu.Unlock()
-	go m.watch(instance, cmd)
+	go m.watch(instance, cmd, instanceDir)
 	go m.awaitReady(instance, cmd)
 	return nil
 }
@@ -1222,7 +1263,7 @@ func (m *Manager) State() State {
 	return state
 }
 
-func (m *Manager) Shutdown() {
+func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.shuttingDown = true
 	instances := make([]*Instance, 0, len(m.allInstances))
@@ -1234,6 +1275,27 @@ func (m *Manager) Shutdown() {
 	m.mu.Unlock()
 	for _, instance := range instances {
 		m.stopInstance(instance)
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		m.mu.RLock()
+		running := false
+		for instance := range m.allInstances {
+			if instance.cmd != nil {
+				running = true
+				break
+			}
+		}
+		m.mu.RUnlock()
+		if !running {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Tor processes to exit: %w", ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 

@@ -46,6 +46,9 @@ func main() {
 	}
 
 	manager := NewManager(cfg)
+	if err := manager.CleanupStaleInstanceDirs(); err != nil {
+		log.Printf("clean stale Tor instance directories: %v", err)
+	}
 	catalog := NewExitCatalog(cfg)
 	healthMonitor := NewRouteHealthMonitor(manager, catalog)
 	configStore := NewConfigStore(*configPath, loaded.Stored)
@@ -85,7 +88,11 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
-	manager.Shutdown()
+	torShutdownCtx, torCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer torCancel()
+	if err := manager.Shutdown(torShutdownCtx); err != nil {
+		log.Printf("shutdown Tor instances: %v", err)
+	}
 }
 
 func defaultConfigPath() string {

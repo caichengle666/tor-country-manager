@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"os"
 	"os/exec"
@@ -518,49 +519,99 @@ func TestReplaceNodeOverridesPendingReplacement(t *testing.T) {
 	}
 }
 
-func TestWatchRemovesReplacementDirectory(t *testing.T) {
-	manager := NewManager(defaultConfig())
-	manager.cfg.StateDir = t.TempDir()
-	code := "us"
-	replacementDir := filepath.Join(manager.cfg.StateDir, code+"-replacement-1700000000000000000")
-	dataDir := filepath.Join(replacementDir, "data")
-	if err := os.MkdirAll(filepath.Join(dataDir, "cache"), 0o700); err != nil {
+func TestWatchRemovesInstanceDirectory(t *testing.T) {
+	for _, name := range []string{"us", "us-replacement-1700000000000000000"} {
+		t.Run(name, func(t *testing.T) {
+			manager := NewManager(defaultConfig())
+			manager.cfg.StateDir = t.TempDir()
+			instanceDir := filepath.Join(manager.cfg.StateDir, name)
+			if err := os.MkdirAll(filepath.Join(instanceDir, "data", "cache"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			instance := manager.instances["us"]
+			instance.stopping = true
+			var cmd *exec.Cmd
+			if runtime.GOOS == "windows" {
+				cmd = exec.Command("cmd", "/c", "exit", "0")
+			} else {
+				cmd = exec.Command("true")
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			instance.cmd = cmd
+			manager.watch(instance, cmd, instanceDir)
+			if _, err := os.Stat(instanceDir); !os.IsNotExist(err) {
+				t.Fatalf("instance directory still exists after watch; err=%v", err)
+			}
+		})
+	}
+}
+
+func TestCleanupStaleInstanceDirectories(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	for _, name := range []string{"us", "jp-replacement-1700000000000000000", "catalog-cache"} {
+		if err := os.MkdirAll(filepath.Join(cfg.StateDir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := NewManager(cfg)
+	if err := manager.CleanupStaleInstanceDirs(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dataDir, "marker"), []byte("sentinel"), 0o600); err != nil {
+	for _, name := range []string{"us", "jp-replacement-1700000000000000000"} {
+		if _, err := os.Stat(filepath.Join(cfg.StateDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("stale directory %q still exists; err=%v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "catalog-cache")); err != nil {
+		t.Fatalf("unrelated directory was removed: %v", err)
+	}
+}
+
+func TestStartFailureRemovesInstanceDirectory(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.TorBinary = filepath.Join(cfg.StateDir, "missing-tor")
+	manager := NewManager(cfg)
+	if err := manager.Start("us"); err == nil {
+		t.Fatal("Start() succeeded with a missing Tor binary")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "us")); !os.IsNotExist(err) {
+		t.Fatalf("failed instance directory still exists; err=%v", err)
+	}
+}
+
+func TestShutdownWaitsForProcessAndCleanup(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	manager := NewManager(cfg)
+	instance := manager.instances["us"]
+	instanceDir := filepath.Join(cfg.StateDir, "us")
+	if err := os.MkdirAll(instanceDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	instance := manager.instances[code]
-	instance.dataDir = dataDir
-	instance.stopping = true
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "exit", "0")
+		cmd = exec.Command("ping", "-n", "30", "127.0.0.1")
 	} else {
-		cmd = exec.Command("true")
+		cmd = exec.Command("sleep", "30")
 	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	instance.cmd = cmd
-	manager.watch(instance, cmd)
-	if _, err := os.Stat(replacementDir); !os.IsNotExist(err) {
-		t.Fatalf("replacement directory still exists after watch; err=%v", err)
-	}
-}
+	instance.Status = "running"
+	go manager.watch(instance, cmd, instanceDir)
 
-func TestReplacementInstanceDir(t *testing.T) {
-	resident := filepath.Join("state", "us", "data")
-	if got := replacementInstanceDir(resident); got != "" {
-		t.Fatalf("resident dir returned %q, want empty", got)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatal(err)
 	}
-	replacement := filepath.Join("state", "us-replacement-1700000000000000000", "data")
-	want := filepath.Join("state", "us-replacement-1700000000000000000")
-	if got := replacementInstanceDir(replacement); got != want {
-		t.Fatalf("replacement dir returned %q, want %q", got, want)
-	}
-	if got := replacementInstanceDir(""); got != "" {
-		t.Fatalf("empty dataDir returned %q, want empty", got)
+	if _, err := os.Stat(instanceDir); !os.IsNotExist(err) {
+		t.Fatalf("instance directory still exists after shutdown; err=%v", err)
 	}
 }
 
