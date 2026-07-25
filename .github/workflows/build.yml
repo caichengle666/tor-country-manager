@@ -68,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   bundle:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request'
     needs: build
     strategy:
       fail-fast: false
