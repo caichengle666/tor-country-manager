@@ -131,7 +131,8 @@ func TestAuthSessionLifecycle(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	if err := store.CreateSession(rec); err != nil {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	if err := store.CreateSession(rec, req); err != nil {
 		t.Fatal(err)
 	}
 	cookies := rec.Result().Cookies()
@@ -140,7 +141,6 @@ func TestAuthSessionLifecycle(t *testing.T) {
 	}
 	token := cookies[0].Value
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	if !store.ValidSession(req) {
 		t.Fatal("valid session was rejected")
@@ -149,6 +149,43 @@ func TestAuthSessionLifecycle(t *testing.T) {
 	store.DeleteSession(rec, req)
 	if store.ValidSession(req) {
 		t.Fatal("session was still valid after deletion")
+	}
+}
+
+func TestAuthSessionCookieIsSecureForHTTPS(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store, err := NewAuthStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://manager.example/api/login", nil)
+	rec := httptest.NewRecorder()
+	if err := store.CreateSession(rec, req); err != nil {
+		t.Fatal(err)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].Secure {
+		t.Fatalf("HTTPS session cookie is not Secure: %+v", cookies)
+	}
+}
+
+func TestAuthSessionCookieIsSecureBehindHTTPSProxy(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store, err := NewAuthStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://manager/api/login", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	if err := store.CreateSession(rec, req); err != nil {
+		t.Fatal(err)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].Secure {
+		t.Fatalf("proxied HTTPS session cookie is not Secure: %+v", cookies)
 	}
 }
 

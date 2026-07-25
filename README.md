@@ -50,7 +50,9 @@ ghcr.io/caichengle666/tor-country-manager:latest
 Web 页面和 SOCKS5 代理默认只监听 `127.0.0.1`。不要把无认证 SOCKS5 端口或 Tor 内部端口直接暴露到公网。远程使用时推荐 SSH 隧道或 VPN。
 
 管理员密码以 PBKDF2-SHA256 加盐哈希保存在状态目录的 `web-password.hash`，不会以明文写入配置。上游 SOCKS5 密码和客户端API密钥保存在 `config.json`，请限制该文件的读取权限。通过Web修改上游代理或客户端API密钥会立即生效；监听地址和客户端入口端口仍需重启。也可以使用环境变量 `TOR_CLIENT_API_KEY` 注入客户端密钥，此时环境变量不会写回配置文件。
+HTTPS 请求和带有 `X-Forwarded-Proto: https` 的反向代理请求会收到带 `Secure` 属性的管理员会话 Cookie。
 已启动国家和已选出口节点保存在状态目录的 `runtime-state.json`。管理器重启后会自动恢复这些路线；手动停止国家或因在线数量限制被停止时，会从恢复列表移除。
+Tor 实例目录是进程级缓存：进程退出后立即删除；启动时也会清理上次崩溃或强制终止留下的国家及 replacement 目录。路线恢复依赖 `runtime-state.json`，不依赖旧缓存目录。
 
 电路轮换通过 Tor ControlPort 的 `SIGNAL NEWNYM` 完成，只影响后续新电路，不会强制中断现有 TCP 连接。请确保状态目录仅允许管理器运行用户读写，因为 ControlPort 的认证 cookie 保存在每个实例的数据目录中。
 
@@ -146,7 +148,7 @@ sudo systemctl status tor-country-manager
 sudo journalctl -u tor-country-manager -f
 ```
 
-默认允许同时保持 `10` 个国家实例在线。达到上限后，选择新国家会停止最早启动且当前未使用的实例。10个实例建议至少准备2GB内存；1GB服务器建议将 `max_running` 调低到 `5` 到 `7`。
+默认允许同时保持 `10` 个国家实例在线。达到上限后，选择新国家会停止最早启动且当前未使用的实例；并发启动、停止和切换请求会串行执行容量检查。节点切换和连接排空期间，新旧进程会短暂共存。10个实例建议至少准备2GB内存；1GB服务器建议将 `max_running` 调低到 `5` 到 `7`。
 
 可写配置位于 `/var/lib/tor-country-manager/config.json`，仅允许 `tor-manager` 服务用户访问。Web管理页面修改在线数量、电路轮换、上游代理或客户端API密钥后会写入该文件并立即应用。只有监听地址和客户端入口端口发生变化时才需要重启服务。
 

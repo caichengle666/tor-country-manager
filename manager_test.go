@@ -519,6 +519,24 @@ func TestReplaceNodeOverridesPendingReplacement(t *testing.T) {
 	}
 }
 
+func TestReplaceNodeRejectsDrainingCurrentInstance(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	current := manager.instances["us"]
+	current.cmd = &exec.Cmd{Process: &os.Process{Pid: -1}}
+	current.Status = "draining"
+	current.draining = true
+	node := ExitNode{CountryCode: "us", Fingerprint: strings.Repeat("E", 40)}
+	if err := manager.replaceNode(current, node, false); err == nil {
+		t.Fatal("replaceNode() accepted a draining current instance")
+	}
+	manager.portMu.Lock()
+	reserved := len(manager.reservedPorts)
+	manager.portMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("%d ports remained reserved after rejected replacement", reserved)
+	}
+}
+
 func TestWatchRemovesInstanceDirectory(t *testing.T) {
 	for _, name := range []string{"us", "us-replacement-1700000000000000000"} {
 		t.Run(name, func(t *testing.T) {
@@ -612,6 +630,103 @@ func TestShutdownWaitsForProcessAndCleanup(t *testing.T) {
 	}
 	if _, err := os.Stat(instanceDir); !os.IsNotExist(err) {
 		t.Fatalf("instance directory still exists after shutdown; err=%v", err)
+	}
+}
+
+func TestFailedInstanceStopsProcessAndKeepsReason(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	manager := NewManager(cfg)
+	manager.shuttingDown = true
+	instance := manager.instances["us"]
+	instanceDir := filepath.Join(cfg.StateDir, "us")
+	if err := os.MkdirAll(instanceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ping", "-n", "30", "127.0.0.1")
+	} else {
+		cmd = exec.Command("sleep", "30")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	instance.cmd = cmd
+	instance.Status = "connecting"
+	go manager.watch(instance, cmd, instanceDir)
+	manager.failInstance(instance, cmd, "bootstrap failed")
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.RLock()
+		done := instance.cmd == nil
+		manager.mu.RUnlock()
+		if done {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	manager.mu.RLock()
+	status, message, running := instance.Status, instance.Error, instance.cmd != nil
+	manager.mu.RUnlock()
+	if running || status != "error" || !strings.Contains(message, "bootstrap failed") {
+		t.Fatalf("failed instance status=%q error=%q running=%v", status, message, running)
+	}
+	if _, err := os.Stat(instanceDir); !os.IsNotExist(err) {
+		t.Fatalf("failed instance directory still exists; err=%v", err)
+	}
+}
+
+func TestStartRejectedAfterShutdown(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.TorBinary = filepath.Join(cfg.StateDir, "missing-tor")
+	manager := NewManager(cfg)
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start("us"); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("Start() error = %v, want shutting down error", err)
+	}
+}
+
+func TestInstanceLogPathUsesCurrentDataDirectory(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	manager := NewManager(cfg)
+	instanceDir := filepath.Join(cfg.StateDir, "us-replacement-1700000000000000000")
+	manager.instances["us"].dataDir = filepath.Join(instanceDir, "data")
+	got, err := manager.InstanceLogPath("us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(instanceDir, "logs", "tor.log")
+	if got != want {
+		t.Fatalf("InstanceLogPath() = %q, want %q", got, want)
+	}
+}
+
+func TestReplacementPortReservationsAreUnique(t *testing.T) {
+	manager := NewManager(defaultConfig())
+	first, err := manager.reserveLocalPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.reserveLocalPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("reserved the same port twice: %d", first)
+	}
+	instance := &Instance{SocksPort: first, controlPort: second, dynamicPorts: true}
+	manager.releaseInstancePorts(instance)
+	manager.portMu.Lock()
+	remaining := len(manager.reservedPorts)
+	manager.portMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("%d replacement ports remain reserved", remaining)
 	}
 }
 

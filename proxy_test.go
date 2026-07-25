@@ -91,3 +91,82 @@ func TestForwardDoesNotConnectToDrainingInstance(t *testing.T) {
 		t.Fatalf("expected EOF for draining instance, got %d bytes err=%v", n, err)
 	}
 }
+
+func TestProxyBothWaysPropagatesHalfClose(t *testing.T) {
+	leftClient, leftProxy := tcpPair(t)
+	rightProxy, rightClient := tcpPair(t)
+	defer leftClient.Close()
+	defer rightClient.Close()
+
+	done := make(chan struct{})
+	go func() {
+		proxyBothWays(leftProxy, rightProxy)
+		close(done)
+	}()
+
+	if _, err := leftClient.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if err := leftClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rightClient.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request, err := io.ReadAll(rightClient)
+	if err != nil || string(request) != "request" {
+		t.Fatalf("right side read %q, err=%v", request, err)
+	}
+	if _, err := rightClient.Write([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rightClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if err := leftClient.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(leftClient)
+	if err != nil || string(response) != "response" {
+		t.Fatalf("left side read %q, err=%v", response, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not finish after both sides half-closed")
+	}
+}
+
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		connection, err := listener.AcceptTCP()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- connection
+	}()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case server := <-accepted:
+		return client, server
+	case err := <-acceptErr:
+		client.Close()
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		client.Close()
+		t.Fatal("timed out accepting TCP test connection")
+	}
+	return nil, nil
+}

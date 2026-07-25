@@ -51,7 +51,17 @@ func (m *Manager) forward(client net.Conn) {
 func proxyBothWays(first, second net.Conn) {
 	var wait sync.WaitGroup
 	wait.Add(2)
-	go func() { defer wait.Done(); _, _ = io.Copy(second, first) }()
-	go func() { defer wait.Done(); _, _ = io.Copy(first, second) }()
+	go proxyCopy(second, first, &wait)
+	go proxyCopy(first, second, &wait)
 	wait.Wait()
+}
+
+func proxyCopy(destination, source net.Conn, wait *sync.WaitGroup) {
+	defer wait.Done()
+	_, _ = io.Copy(destination, source)
+	if connection, ok := destination.(interface{ CloseWrite() error }); ok {
+		_ = connection.CloseWrite()
+	} else {
+		_ = destination.Close()
+	}
 }

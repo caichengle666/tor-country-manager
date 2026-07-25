@@ -53,13 +53,17 @@ type Instance struct {
 	pendingReplacement        *Instance
 	restartAttempts           int
 	restartScheduled          bool
+	dynamicPorts              bool
 }
 
 type Manager struct {
 	cfg              Config
 	mu               sync.RWMutex
+	startMu          sync.Mutex
 	stateMu          sync.Mutex
 	dirMu            sync.Mutex
+	portMu           sync.Mutex
+	reservedPorts    map[int]struct{}
 	instances        map[string]*Instance
 	allInstances     map[*Instance]struct{}
 	resumeNodes      map[string]PersistedNode
@@ -88,7 +92,7 @@ type persistedManagerState struct {
 }
 
 func NewManager(cfg Config) *Manager {
-	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), allInstances: make(map[*Instance]struct{}), resumeNodes: make(map[string]PersistedNode), countryListeners: make(map[string]net.Listener), clientAuth: NewRuntimeClientAuth(cfg.ClientAPIKey)}
+	m := &Manager{cfg: cfg, instances: make(map[string]*Instance), allInstances: make(map[*Instance]struct{}), resumeNodes: make(map[string]PersistedNode), reservedPorts: make(map[int]struct{}), countryListeners: make(map[string]net.Listener), clientAuth: NewRuntimeClientAuth(cfg.ClientAPIKey)}
 	for index, country := range cfg.Countries {
 		country.Code = normalizeCode(country.Code)
 		m.instances[country.Code] = &Instance{
@@ -232,6 +236,18 @@ func (m *Manager) Restore() {
 
 func (m *Manager) Start(code string) error {
 	code = normalizeCode(code)
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	m.mu.RLock()
+	_, known := m.instances[code]
+	shuttingDown := m.shuttingDown
+	m.mu.RUnlock()
+	if !known {
+		return fmt.Errorf("unknown country %q", code)
+	}
+	if shuttingDown {
+		return errors.New("manager is shutting down")
+	}
 	if err := m.makeRoom(code); err != nil {
 		return err
 	}
@@ -312,7 +328,7 @@ func (m *Manager) makeRoom(target string) error {
 	}
 	code := oldest.Country.Code
 	m.mu.RUnlock()
-	return m.Stop(code)
+	return m.stop(code)
 }
 
 func (m *Manager) torrc(instance *Instance, dataDir, logDir string) string {
@@ -375,9 +391,12 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd, instanceDir string) {
 	m.mu.Lock()
 	if instance.cmd != cmd {
 		m.mu.Unlock()
+		m.releaseInstancePorts(instance)
 		m.removeInstanceDir(instanceDir)
 		return
 	}
+	previousStatus := instance.Status
+	previousError := instance.Error
 	instance.cmd = nil
 	delete(m.allInstances, instance)
 	if instance.stopping {
@@ -385,7 +404,9 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd, instanceDir string) {
 		instance.Error = ""
 	} else {
 		instance.Status = "error"
-		if err != nil {
+		if previousStatus == "error" && previousError != "" {
+			instance.Error = previousError
+		} else if err != nil {
 			instance.Error = err.Error()
 		} else {
 			instance.Error = "Tor exited unexpectedly"
@@ -393,6 +414,7 @@ func (m *Manager) watch(instance *Instance, cmd *exec.Cmd, instanceDir string) {
 	}
 	instance.stopping = false
 	m.mu.Unlock()
+	m.releaseInstancePorts(instance)
 	m.removeInstanceDir(instanceDir)
 
 	m.mu.Lock()
@@ -508,12 +530,7 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 			instance.Status = "connecting"
 			m.mu.Unlock()
 			if err := m.applyUpstream(instance, m.upstreamConfig()); err != nil {
-				m.mu.Lock()
-				if instance.cmd == cmd && instance.Status == "connecting" {
-					instance.Status = "error"
-					instance.Error = "apply upstream proxy: " + err.Error()
-				}
-				m.mu.Unlock()
+				m.failInstance(instance, cmd, "apply upstream proxy: "+err.Error())
 				return
 			}
 			m.awaitBootstrap(instance, cmd)
@@ -521,12 +538,7 @@ func (m *Manager) awaitReady(instance *Instance, cmd *exec.Cmd) {
 		}
 		time.Sleep(time.Second)
 	}
-	m.mu.Lock()
-	if instance.cmd == cmd && instance.Status == "starting" {
-		instance.Status = "error"
-		instance.Error = "Tor did not open its SOCKS port within 90 seconds"
-	}
-	m.mu.Unlock()
+	m.failInstance(instance, cmd, "Tor did not open its SOCKS port within 90 seconds")
 }
 
 func (m *Manager) awaitBootstrap(instance *Instance, cmd *exec.Cmd) {
@@ -544,15 +556,28 @@ func (m *Manager) awaitBootstrap(instance *Instance, cmd *exec.Cmd) {
 		}
 		time.Sleep(4 * time.Second)
 	}
+	m.failInstance(instance, cmd, "Tor did not obtain a working exit within 3 minutes; the network may block Tor")
+}
+
+func (m *Manager) failInstance(instance *Instance, cmd *exec.Cmd, message string) {
 	m.mu.Lock()
-	if instance.cmd == cmd && instance.Status == "connecting" {
-		instance.Status = "error"
-		instance.Error = "Tor did not obtain a working exit within 3 minutes; the network may block Tor"
+	if instance.cmd != cmd || instance.stopping || instance.draining {
+		m.mu.Unlock()
+		return
 	}
+	instance.Status = "error"
+	instance.Error = message
 	m.mu.Unlock()
+	m.signalProcess(instance, cmd)
 }
 
 func (m *Manager) Stop(code string) error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	return m.stop(code)
+}
+
+func (m *Manager) stop(code string) error {
 	code = normalizeCode(code)
 	m.mu.Lock()
 	instance, ok := m.instances[code]
@@ -638,6 +663,10 @@ func (m *Manager) stopInstance(instance *Instance) {
 	instance.draining = true
 	instance.Status = "stopping"
 	m.mu.Unlock()
+	m.signalProcess(instance, cmd)
+}
+
+func (m *Manager) signalProcess(instance *Instance, cmd *exec.Cmd) {
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		_ = cmd.Process.Kill()
 	}
@@ -677,12 +706,19 @@ func (m *Manager) Activate(code string) error {
 		return err
 	}
 	m.mu.Lock()
+	instance := m.instances[code]
+	if instance == nil || instance.draining || (instance.Status != "starting" && instance.Status != "connecting" && instance.Status != "running" && instance.Status != "switching") {
+		m.mu.Unlock()
+		return errors.New("Tor instance stopped before it could be activated")
+	}
 	m.active = code
 	m.mu.Unlock()
 	return nil
 }
 
 func (m *Manager) UpdateMaxRunning(limit int) {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
 	m.mu.Lock()
 	m.cfg.MaxRunning = limit
 	running := 0
@@ -710,7 +746,7 @@ func (m *Manager) UpdateMaxRunning(limit int) {
 	}
 	m.mu.Unlock()
 	for _, code := range codes {
-		_ = m.Stop(code)
+		_ = m.stop(code)
 	}
 }
 
@@ -786,15 +822,30 @@ func (m *Manager) startNode(node ExitNode, activate bool) error {
 }
 
 func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) error {
-	replacementPort, err := availableLocalPort()
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	m.mu.RLock()
+	shuttingDown := m.shuttingDown
+	m.mu.RUnlock()
+	if shuttingDown {
+		return errors.New("manager is shutting down")
+	}
+	replacementPort, err := m.reserveLocalPort()
 	if err != nil {
 		return err
 	}
-	replacementControlPort, err := availableLocalPort()
+	replacementControlPort, err := m.reserveLocalPort()
 	if err != nil {
+		m.releaseReservedPort(replacementPort)
 		return err
 	}
 	m.mu.Lock()
+	if m.instances[current.Country.Code] != current || current.cmd == nil || current.stopping || current.draining {
+		m.mu.Unlock()
+		m.releaseReservedPort(replacementPort)
+		m.releaseReservedPort(replacementControlPort)
+		return errors.New("current Tor instance is no longer available for replacement")
+	}
 	previous := current.pendingReplacement
 	if !current.replacement {
 		current.replacementPreviousStatus = current.Status
@@ -812,6 +863,7 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 		ExitFingerprint: strings.ToUpper(node.Fingerprint),
 		SelectedIP:      node.IP,
 		SelectedNode:    node.Nickname,
+		dynamicPorts:    true,
 	}
 	current.pendingReplacement = replacement
 	m.mu.Unlock()
@@ -834,6 +886,8 @@ func (m *Manager) replaceNode(current *Instance, node ExitNode, activate bool) e
 }
 
 func (m *Manager) CancelReplacement(code string) error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
 	code = normalizeCode(code)
 	m.mu.Lock()
 	current, ok := m.instances[code]
@@ -900,16 +954,46 @@ func (m *Manager) resumeAfterReplacement(current *Instance, cmd *exec.Cmd, statu
 	}
 }
 
-func availableLocalPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, fmt.Errorf("allocate replacement SOCKS port: %w", err)
+func (m *Manager) reserveLocalPort() (int, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, fmt.Errorf("allocate replacement port: %w", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		m.portMu.Lock()
+		_, reserved := m.reservedPorts[port]
+		if !reserved {
+			m.reservedPorts[port] = struct{}{}
+		}
+		m.portMu.Unlock()
+		if err := listener.Close(); err != nil {
+			if !reserved {
+				m.releaseReservedPort(port)
+			}
+			return 0, fmt.Errorf("release replacement port listener: %w", err)
+		}
+		if !reserved {
+			return port, nil
+		}
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		return 0, fmt.Errorf("release replacement SOCKS port: %w", err)
+	return 0, errors.New("could not reserve a unique replacement port")
+}
+
+func (m *Manager) releaseReservedPort(port int) {
+	m.portMu.Lock()
+	delete(m.reservedPorts, port)
+	m.portMu.Unlock()
+}
+
+func (m *Manager) releaseInstancePorts(instance *Instance) {
+	if !instance.dynamicPorts {
+		return
 	}
-	return port, nil
+	m.portMu.Lock()
+	delete(m.reservedPorts, instance.SocksPort)
+	delete(m.reservedPorts, instance.controlPort)
+	m.portMu.Unlock()
 }
 
 func (m *Manager) startDetached(instance *Instance, suffix string) error {
@@ -917,10 +1001,12 @@ func (m *Manager) startDetached(instance *Instance, suffix string) error {
 	instanceDir := filepath.Join(m.cfg.StateDir, code+"-"+suffix)
 	cmd, err := m.prepareTorCommand(instance, instanceDir)
 	if err != nil {
+		m.releaseInstancePorts(instance)
 		m.removeInstanceDir(instanceDir)
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		m.releaseInstancePorts(instance)
 		m.removeInstanceDir(instanceDir)
 		return fmt.Errorf("start replacement tor: %w", err)
 	}
@@ -1263,32 +1349,44 @@ func (m *Manager) State() State {
 	return state
 }
 
+func (m *Manager) InstanceLogPath(code string) (string, error) {
+	code = normalizeCode(code)
+	m.mu.RLock()
+	instance := m.instances[code]
+	if instance == nil || instance.dataDir == "" {
+		m.mu.RUnlock()
+		return "", fmt.Errorf("no Tor log is available for country %q", code)
+	}
+	dataDir := instance.dataDir
+	m.mu.RUnlock()
+	return filepath.Join(filepath.Dir(dataDir), "logs", "tor.log"), nil
+}
+
 func (m *Manager) Shutdown(ctx context.Context) error {
+	m.startMu.Lock()
 	m.mu.Lock()
 	m.shuttingDown = true
-	instances := make([]*Instance, 0, len(m.allInstances))
-	for instance := range m.allInstances {
-		if instance.cmd != nil {
-			instances = append(instances, instance)
-		}
-	}
 	m.mu.Unlock()
-	for _, instance := range instances {
-		m.stopInstance(instance)
-	}
+	m.startMu.Unlock()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		m.mu.RLock()
-		running := false
+		m.mu.Lock()
+		instances := make([]*Instance, 0, len(m.allInstances))
+		running := 0
 		for instance := range m.allInstances {
 			if instance.cmd != nil {
-				running = true
-				break
+				running++
+				if !instance.stopping {
+					instances = append(instances, instance)
+				}
 			}
 		}
-		m.mu.RUnlock()
-		if !running {
+		m.mu.Unlock()
+		for _, instance := range instances {
+			m.stopInstance(instance)
+		}
+		if running == 0 {
 			return nil
 		}
 		select {

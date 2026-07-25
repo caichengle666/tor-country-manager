@@ -126,7 +126,7 @@ func routes(manager *Manager, catalog *ExitCatalog, healthMonitor *RouteHealthMo
 			writeError(w, err)
 			return
 		}
-		if err := authStore.CreateSession(w); err != nil {
+		if err := authStore.CreateSession(w, r); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -151,7 +151,7 @@ func routes(manager *Manager, catalog *ExitCatalog, healthMonitor *RouteHealthMo
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "administrator password is incorrect"})
 			return
 		}
-		if err := authStore.CreateSession(w); err != nil {
+		if err := authStore.CreateSession(w, r); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -253,7 +253,7 @@ func routes(manager *Manager, catalog *ExitCatalog, healthMonitor *RouteHealthMo
 			writeError(w, err)
 			return
 		}
-		if err := authStore.CreateSession(w); err != nil {
+		if err := authStore.CreateSession(w, r); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -294,7 +294,12 @@ func routes(manager *Manager, catalog *ExitCatalog, healthMonitor *RouteHealthMo
 			writeError(w, errors.New("invalid country code"))
 			return
 		}
-		text, err := tailFile(filepath.Join(cfg.StateDir, code, "logs", "tor.log"), 200)
+		logPath, err := manager.InstanceLogPath(code)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		text, err := tailFile(logPath, 200)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -465,6 +470,9 @@ func decodeJSON(r *http.Request, target any) error {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("invalid JSON request: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("invalid JSON request: request body must contain one JSON value")
 	}
 	return nil
 }

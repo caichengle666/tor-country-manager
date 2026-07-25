@@ -156,7 +156,7 @@ func (a *AuthStore) verifyLocked(password string) bool {
 	return false
 }
 
-func (a *AuthStore) CreateSession(w http.ResponseWriter) error {
+func (a *AuthStore) CreateSession(w http.ResponseWriter, r *http.Request) error {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return err
@@ -176,6 +176,7 @@ func (a *AuthStore) CreateSession(w http.ResponseWriter) error {
 		Path:     "/",
 		MaxAge:   int(sessionLifetime.Seconds()),
 		HttpOnly: true,
+		Secure:   secureRequest(r),
 		SameSite: http.SameSiteStrictMode,
 	})
 	return nil
@@ -198,7 +199,18 @@ func (a *AuthStore) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, cookie.Value)
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: secureRequest(r), SameSite: http.SameSiteStrictMode})
+}
+
+func secureRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(forwarded, "https")
 }
 
 func hashPassword(password string) (string, error) {
