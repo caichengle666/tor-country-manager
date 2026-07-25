@@ -165,8 +165,15 @@ jobs:
           gpg --batch --import tor-browser-signing-key.asc
           curl -fsSL -o tor-sha256sums.txt \
             https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/sha256sums-signed-build.txt
-          verification="$(gpg --batch --status-fd=1 --verify tor-sha256sums.txt 2>&1)"
-          printf '%s\n' "$verification" | grep -q "VALIDSIG $fingerprint "
+          if ! verification="$(gpg --batch --status-fd=1 --verify tor-sha256sums.txt 2>&1)"; then
+            printf '%s\n' "$verification"
+            exit 1
+          fi
+          printf '%s\n' "$verification"
+          printf '%s\n' "$verification" | awk -v fingerprint="$fingerprint" '
+            $1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == fingerprint || $NF == fingerprint) { valid = 1 }
+            END { exit valid ? 0 : 1 }
+          '
           expected=""
           while read -r hash file; do
             file="${file#\*}"
