@@ -157,7 +157,11 @@ jobs:
               brew install gnupg
             fi
           fi
-          export GNUPGHOME="$RUNNER_TEMP/tor-browser-gnupg"
+          gnupg_home="$RUNNER_TEMP/tor-browser-gnupg"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            gnupg_home="$(cygpath -u "$RUNNER_TEMP")/tor-browser-gnupg"
+          fi
+          export GNUPGHOME="$gnupg_home"
           mkdir -p "$GNUPGHOME"
           chmod 0700 "$GNUPGHOME" || true
           curl -fsSL -o tor-browser-signing-key.asc \
@@ -165,7 +169,9 @@ jobs:
           gpg --batch --import tor-browser-signing-key.asc
           curl -fsSL -o tor-sha256sums.txt \
             https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/sha256sums-signed-build.txt
-          if ! verification="$(gpg --batch --status-fd=1 --verify tor-sha256sums.txt 2>&1)"; then
+          curl -fsSL -o tor-sha256sums.txt.asc \
+            https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/sha256sums-signed-build.txt.asc
+          if ! verification="$(gpg --batch --status-fd=1 --verify tor-sha256sums.txt.asc tor-sha256sums.txt 2>&1)"; then
             printf '%s\n' "$verification"
             exit 1
           fi
