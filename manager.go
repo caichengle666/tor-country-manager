@@ -554,7 +554,7 @@ func (m *Manager) awaitBootstrap(instance *Instance, cmd *exec.Cmd) {
 		if m.refreshInstanceExitIP(instance, cmd) {
 			return
 		}
-		time.Sleep(4 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 	m.failInstance(instance, cmd, "Tor did not obtain a working exit within 3 minutes; the network may block Tor")
 }
@@ -1406,29 +1406,49 @@ func (m *Manager) refreshInstanceExitIP(instance *Instance, cmd *exec.Cmd) bool 
 		return dialViaSOCKS5(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), address)
 	}
 	client := &http.Client{
-		Timeout: 20 * time.Second,
+		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
 			DialContext:     dialer,
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
+
+	// Primary: check.torproject.org confirms Tor and returns exit IP.
 	resp, err := client.Get("https://check.torproject.org/api/ip")
-	if err != nil {
+	if err == nil {
+		var result struct {
+			IP    string `json:"IP"`
+			IsTor bool   `json:"IsTor"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result) == nil && result.IsTor && net.ParseIP(result.IP) != nil {
+			resp.Body.Close()
+			if !m.markInstanceRunning(instance, cmd, result.IP) {
+				return false
+			}
+			m.startCircuitRotation(instance)
+			m.lookupExitInfo(client, instance, result.IP)
+			return true
+		}
+		resp.Body.Close()
+	}
+
+	// Fallback: ipify.org confirms the circuit works and provides the exit IP.
+	fallbackResp, fallbackErr := client.Get("https://api.ipify.org?format=json")
+	if fallbackErr != nil {
 		return false
 	}
-	defer resp.Body.Close()
-	var result struct {
-		IP    string `json:"IP"`
-		IsTor bool   `json:"IsTor"`
+	defer fallbackResp.Body.Close()
+	var fallbackResult struct {
+		IP string `json:"ip"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result); err != nil || !result.IsTor {
+	if json.NewDecoder(io.LimitReader(fallbackResp.Body, 64<<10)).Decode(&fallbackResult) != nil || net.ParseIP(fallbackResult.IP) == nil {
 		return false
 	}
-	if !m.markInstanceRunning(instance, cmd, result.IP) {
+	if !m.markInstanceRunning(instance, cmd, fallbackResult.IP) {
 		return false
 	}
 	m.startCircuitRotation(instance)
-	m.lookupExitInfo(client, instance, result.IP)
+	m.lookupExitInfo(client, instance, fallbackResult.IP)
 	return true
 }
 
